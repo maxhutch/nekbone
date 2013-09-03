@@ -6,8 +6,10 @@ J:=$S/jl
 OPT_INCDIR:=./
 OBJDIR=obj
 IFMPI= 
+IFCUDA= 
 F77=
 CC=
+NVCC=
 P=
 PPPO=
 PPS=
@@ -31,6 +33,10 @@ speclib.o
 # MXM 
 MXM = mxm_std.o
 
+################################################################################
+# CUDA
+CUDA = cuda_main.o
+
 # JL Routines ###################################################################
 JO  = jl_
 JL := -DPREFIX=jl_
@@ -51,7 +57,7 @@ else
 endif
 
 #####################################################################################
-TMP0 = $(EXTRA) $(COMM_MPI) $(MXM)
+TMP0 = $(EXTRA) $(COMM_MPI) $(MXM) $(CUDA)
 NOBJS_F0 = $(patsubst %,$(OBJDIR)/%,$(TMP0))
 TMP0c = $(JLCORE)
 NOBJS_C0 = $(patsubst %,$(OBJDIR)/%,$(TMP0c))
@@ -115,6 +121,7 @@ $(OBJDIR)/blas.o        :$S/blas.f; 		        $(F77) -c $(FL2i4) $< -o $@
 $(OBJDIR)/byte_mpi.o	:$S/byte_mpi.f;			$(F77) -c $(FL2) $< -o $@
 $(OBJDIR)/comm_mpi.o	:$S/comm_mpi.f;			$(F77) -c $(FL2) $< -o $@
 $(OBJDIR)/mpi_dummy.o	:$S/mpi_dummy.f;		$(F77) -c $(FL2) $< -o $@
+$(OBJDIR)/cuda_main.o	:$S/cuda_main.cu;		$(NVCC) -c $< -o $@
 # MXM       ############################################################################
 $(OBJDIR)/mxm_wrapper.o	  :$S/mxm_wrapper.f;		$(F77) -c $(FL2) $< -o $@ 
 $(OBJDIR)/mxm_std.o	  :$S/mxm_std.f;		$(F77) -c $(FL4) $< -o $@

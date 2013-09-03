@@ -3,13 +3,16 @@
 # (c) 2008,2009,2010 UCHICAGO ARGONNE, LLC
 
 # source path 
-SOURCE_ROOT="$HOME/nekbone-2.1/src" 
+SOURCE_ROOT="$HOME/nekbone/src" 
 
 # Fortran compiler
 F77="mpif77"
 
 # C compiler
 CC="mpicc"
+
+# CUDA Compiler
+NVCC="nvcc --compiler-bindir /usr/bin/gcc-4.6"
 
 # pre-processor symbol list 
 # (set PPLIST=? to get a list of available symbols)
@@ -22,13 +25,16 @@ CC="mpicc"
 # enable MPI (default true)
 #IFMPI="false"
 
+# enable CUDA (default false)
+#IFCUDA="true"
+
 # auxilliary files to compile
 # NOTE: source files have to located in the same directory as makenek
 #       a makefile_usr.inc has to be provided containing the build rules 
 #USR="foo.o"
 
 # linking flags
-#USR_LFLAGS="-L/usr/lib -lfoo"
+USR_LFLAGS="-lstdc++ -L/opt/lib64 -lcuda -lcudart -lcublas"
 
 # generic compiler flags
 #G="-g"

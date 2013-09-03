@@ -183,6 +183,14 @@ else
   PPLIST="${PPLIST} MPI"
 fi
 export IFMPI
+if [ "$IFCUDA" == "true" -o "$CUDA" == "yes" ]; then
+  IFCUDA=true
+  PPLIST="${PPLIST} CUDA"
+else
+  # default
+  IFCUDA=false
+fi
+export IFCUDA
 
 # Check size of long int
 cat > tmp.c << _ACEOF
@@ -253,6 +261,7 @@ rm -rf makefile 2>/dev/null
 
 sed -e "s:^F77[ ]*=.*:F77\:=$F77:" \
 -e "s:^CC[ ]*=.*:CC\:=$CC:" \
+-e "s:^NVCC[ ]*=.*:NVCC\:=$NVCC:" \
 -e "s:^G[ ]*=.*:G\:=$G:" \
 -e "s:^OPT_FLAGS[ ]*=.*:OPT_FLAGS\:=$OPT_FLAGS:" \
 -e "s/^P[ ]*=.*/P:=$P/" \
@@ -264,6 +273,7 @@ sed -e "s:^F77[ ]*=.*:F77\:=$F77:" \
 -e "s/^PPS[ ]*=.*/PPS=$PPLIST/" \
 -e "s:^MXM[ ]*=.*:MXM=$MXM_USER:" \
 -e "s/^IFMPI[ ]*=.*/IFMPI:=$IFMPI/" \
+-e "s/^IFCUDA[ ]*=.*/IFCUDA:=$IFCUDA/" \
 -e "s:^USR[ ]*=.*:USR\:=$USR:" \
 -e "s:^USR_LFLAGS[ ]*=.*:USR_LFLAGS\:=$USR_LFLAGS:" \
 -e "s:^S[ ]*=.*:S\:=${SOURCE_ROOT}:" ./makefile.template >.makefile

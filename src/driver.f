@@ -1,3 +1,4 @@
+#define USE_CUDA
 c-----------------------------------------------------------------------
       program nekbone
       
@@ -18,6 +19,9 @@ c-----------------------------------------------------------------------
       integer iel0,ielN   ! element range per proc.
       integer nx0,nxN     ! poly. order range
 
+#ifdef USE_CUDA
+      call setup_cuda()
+#endif
 
       call iniproc(mpi_comm_world)    ! has nekmpi common block
       call read_param(ifbrick,iel0,ielN,nx0,nxN)
