@@ -148,10 +148,9 @@ c-------------------------------------------------------------------------
       nxyz = nx1*ny1*nz1
       n    = nx1-1
 #ifdef USE_CUDA
-      call local_grad3_cuda(ur,us,ut,u,n,dxm1,dxtm1)
+      call local_grad3_comb_cuda(w, u,dxm1,dxtm1,g,n)
 #else
       call local_grad3(ur,us,ut,u,n,dxm1,dxtm1)
-#endif
       do i=1,nxyz
          wr = g(1,i)*ur(i) + g(2,i)*us(i) + g(3,i)*ut(i)
          ws = g(2,i)*ur(i) + g(4,i)*us(i) + g(5,i)*ut(i)
@@ -160,9 +159,8 @@ c-------------------------------------------------------------------------
          us(i) = ws
          ut(i) = wt
       enddo
-
       call local_grad3_t(w,ur,us,ut,n,dxm1,dxtm1,wk)
-
+#endif
       return
       end
 c-------------------------------------------------------------------------
@@ -199,7 +197,7 @@ c     Output: ur,us,ut         Input:u,N,D,Dt
       call mxm(Dt,m1,ur,m1,u,m2)
 
       do k=0,N
-         call mxm(us(0,0,k),m1,D ,m1,w(0,0,k),m1)
+         call mxm(us(1,0,k),m1,D ,m1,w(0,0,k),m1)
       enddo
       call add2(u,w,m3)
 
