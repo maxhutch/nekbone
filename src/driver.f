@@ -1,4 +1,3 @@
-#define USE_CUDA
 c-----------------------------------------------------------------------
       program nekbone
       
@@ -57,6 +56,10 @@ c     SET UP and RUN NEKBONE
 
 c     TEST BANDWIDTH BISECTION CAPACITY
 c     call xfer(np,cr_h)
+
+#ifdef USE_CUDA
+      call teardown_cuda()
+#endif USE_CUDA
 
       call exitt0
 

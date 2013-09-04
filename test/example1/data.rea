@@ -1,3 +1,3 @@
 .false. = ifbrick            ! brick or linear geometry
-1   100  = iel0,ielN (per processor)  ! range of number of elements per proc.
-10  10  = nx0,nxN                 ! poly. order range for nx1
+1   8  = iel0,ielN (per processor)  ! range of number of elements per proc.
+32  32  = nx0,nxN                 ! poly. order range for nx1

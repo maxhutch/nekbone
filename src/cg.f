@@ -147,9 +147,11 @@ c-------------------------------------------------------------------------
 
       nxyz = nx1*ny1*nz1
       n    = nx1-1
-
+#ifdef USE_CUDA
+      call local_grad3_cuda(ur,us,ut,u,n,dxm1,dxtm1)
+#else
       call local_grad3(ur,us,ut,u,n,dxm1,dxtm1)
-
+#endif
       do i=1,nxyz
          wr = g(1,i)*ur(i) + g(2,i)*us(i) + g(3,i)*ut(i)
          ws = g(2,i)*ur(i) + g(4,i)*us(i) + g(5,i)*ut(i)
@@ -169,7 +171,6 @@ c     Output: ur,us,ut         Input:u,n,D,Dt
       real ur(0:n,0:n,0:n),us(0:n,0:n,0:n),ut(0:n,0:n,0:n)
       real u (0:n,0:n,0:n)
       real D (0:n,0:n),Dt(0:n,0:n)
-      integer e
 
       m1 = n+1
       m2 = m1*m1

@@ -18,10 +18,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
-#include "cufft.h"
-#include "cublas_v2.h"
 #include "cuda.h"
-#include "cuComplex.h"
 #include <iostream>
 #include <unistd.h>
 #ifdef __PARA
@@ -49,7 +46,6 @@ typedef struct cuda_device{
 } cuda_device;
 
 
-cublasHandle_t cublas_ctx;
 int nPE, myPE;
 int this_device;
 int already_setup = 0;
@@ -113,13 +109,13 @@ extern "C" int setup_cuda_(void){
   best_device = -1;  best_mem = 0; best_used = 10000000;
   for (device = 0; device < deviceCount; device++){
     if (device_list[device].used < best_used &&
-        device_list[device].properties.major >= 1){
+        device_list[device].properties.major >= 2){
       best_device = device;
       best_mem = device_list[device].properties.totalGlobalMem;
       best_used = device_list[device].used;
     } else if (device_list[device].used == best_used &&
                device_list[device].properties.totalGlobalMem > best_mem &&
-               device_list[device].properties.major >= 1){
+               device_list[device].properties.major >= 2){
       best_device = device;
       best_mem = device_list[device].properties.totalGlobalMem;
       best_used = device_list[device].used;
@@ -156,8 +152,6 @@ extern "C" int setup_cuda_(void){
   fprintf(stdout,"#   %-30s - %d #\n", device_list[best_device].properties.name, best_device);
   fprintf(stdout,"#                                      #\n");
   fprintf(stdout,"#======================================#\n");
- 
-  cublasCreate(&cublas_ctx);
   fprintf(stdout, "Created cuBLAS context\n");
   fflush(stdout);
 
@@ -178,10 +172,6 @@ extern "C" int setup_cuda_(void){
  * Only called in main.F
  */
 extern "C" int teardown_cuda_(void){
-  cublasDestroy(cublas_ctx);
-  fprintf(stdout, "Destroyed cuBLAS context \n");
-  fflush(stdout);
-
   int deviceCount;
   CUDA_CALL(cudaGetDeviceCount(&deviceCount));
   
