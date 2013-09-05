@@ -104,12 +104,14 @@ c-----------------------------------------------------------------------
 c      real ur(lxyz),us(lxyz),ut(lxyz),wk(lxyz)
 
       integer e
-
+#ifdef USE_CUDA
+      call ax_e_cuda(w, u,dxm1,dxtm1,gxyz,nx1-1,nelt)
+#else
       do e=1,nelt                                ! ~
          call ax_e( w(1,e),u(1,e),gxyz(1,1,e)    ! w   = A  u
      $                             ,ur,us,ut,wk) !  L     L  L
       enddo                                      ! 
-
+#endif
       call gs_op(gsh,w,1,1,0)  ! Gather-scatter operation  ! w   = QQ  w
                                                            !            L
       call add2s2(w,u,.1,n)
