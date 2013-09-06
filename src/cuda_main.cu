@@ -152,7 +152,6 @@ extern "C" int setup_cuda_(void){
   fprintf(stdout,"#   %-30s - %d #\n", device_list[best_device].properties.name, best_device);
   fprintf(stdout,"#                                      #\n");
   fprintf(stdout,"#======================================#\n");
-  fprintf(stdout, "Created cuBLAS context\n");
   fflush(stdout);
 
 #ifdef __PARA
