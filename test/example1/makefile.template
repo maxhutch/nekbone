@@ -36,7 +36,7 @@ MXM = mxm_std.o
 ################################################################################
 # CUDA
 ifeq ($(IFCUDA), true)
-  CUDA = cuda_main.o cuda_simple.o
+  CUDA = cuda_main.o ax_cuda.o
   PPS_F += -DUSE_CUDA
 else
   CUDA = 
@@ -127,7 +127,7 @@ $(OBJDIR)/byte_mpi.o	:$S/byte_mpi.f;			$(F77) -c $(FL2) $< -o $@
 $(OBJDIR)/comm_mpi.o	:$S/comm_mpi.f;			$(F77) -c $(FL2) $< -o $@
 $(OBJDIR)/mpi_dummy.o	:$S/mpi_dummy.f;		$(F77) -c $(FL2) $< -o $@
 $(OBJDIR)/cuda_main.o	:$S/cuda_main.cu;		$(NVCC) -c $(G) $< -o $@
-$(OBJDIR)/cuda_simple.o	:$S/cuda_simple.cu;		$(NVCC) -c $(G) $< -o $@
+$(OBJDIR)/ax_cuda.o	:$S/ax_cuda.cu;		$(NVCC) -c $(G) $< -o $@
 # MXM       ############################################################################
 $(OBJDIR)/mxm_wrapper.o	  :$S/mxm_wrapper.f;		$(F77) -c $(FL2) $< -o $@ 
 $(OBJDIR)/mxm_std.o	  :$S/mxm_std.f;		$(F77) -c $(FL4) $< -o $@

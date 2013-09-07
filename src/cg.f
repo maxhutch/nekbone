@@ -44,6 +44,10 @@ c     set machine tolerances
       iter = 0
       if (nid.eq.0)write(6,6) iter,rnorm
 
+#ifdef USE_CUDA
+      call setup_cg(w,p,g,nx1-1,nelt)
+#endif
+
       miter = niter
       do iter=1,miter
          call solveM(z,r,n)    ! preconditioner here
@@ -75,6 +79,10 @@ c        if (rtr.le.rlim2) goto 1001
       enddo
 
  1001 continue
+
+#ifdef USE_CUDA
+      call teardown_cg(w,p,g,nx1-1,nelt)
+#endif
 
       if (nid.eq.0) write(6,6) iter,rnorm,alpha,beta,pap
 
@@ -149,9 +157,6 @@ c-------------------------------------------------------------------------
 
       nxyz = nx1*ny1*nz1
       n    = nx1-1
-#ifdef USE_CUDA
-      call local_grad3_comb_cuda(w, u,dxm1,dxtm1,g,n)
-#else
       call local_grad3(ur,us,ut,u,n,dxm1,dxtm1)
       do i=1,nxyz
          wr = g(1,i)*ur(i) + g(2,i)*us(i) + g(3,i)*ut(i)
@@ -162,7 +167,6 @@ c-------------------------------------------------------------------------
          ut(i) = wt
       enddo
       call local_grad3_t(w,ur,us,ut,n,dxm1,dxtm1,wk)
-#endif
       return
       end
 c-------------------------------------------------------------------------
