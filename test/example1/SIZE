@@ -1,7 +1,7 @@
 C     Dimension file to be included
 
       parameter (ldim=3)                      ! dimension
-      parameter (lx1=32,ly1=lx1,lz1=lx1)      ! polynomial order
+      parameter (lx1=64,ly1=lx1,lz1=lx1)      ! polynomial order
 
       parameter (lp = 8)                     ! max number of processors
       parameter (lelt=8)                    ! max number of elements, per proc

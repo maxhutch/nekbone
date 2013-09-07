@@ -50,6 +50,7 @@ int nPE, myPE;
 int this_device;
 int already_setup = 0;
 
+cudaStream_t* streams;
 
 /** Initialize the cuda context, which includes picking a device */
 extern "C" int setup_cuda_(void){
@@ -162,7 +163,11 @@ extern "C" int setup_cuda_(void){
   }
 
   free(device_list);
-  
+ 
+  streams = (cudaStream_t*) malloc(32 * sizeof(cudaStream_t));
+  for (i = 0; i < 32; i++)
+      cudaStreamCreate(streams + i);
+
   return EXIT_SUCCESS;
 }
 
@@ -171,6 +176,12 @@ extern "C" int setup_cuda_(void){
  * Only called in main.F
  */
 extern "C" int teardown_cuda_(void){
+  int i;
+  for (i = 0; i < 32; i++)
+    cudaStreamDestroy(streams[i]);
+  free(streams);
+
+
   int deviceCount;
   CUDA_CALL(cudaGetDeviceCount(&deviceCount));
   
@@ -179,7 +190,7 @@ extern "C" int teardown_cuda_(void){
   int best_device;
   int best_used, used;
   size_t best_mem;
-  int i, PE;
+  int PE;
   FILE* dev_file;
   char buffer[100];
 
