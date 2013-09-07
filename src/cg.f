@@ -199,7 +199,7 @@ c     Output: ur,us,ut         Input:u,N,D,Dt
       call mxm(Dt,m1,ur,m1,u,m2)
 
       do k=0,N
-         call mxm(us(1,0,k),m1,D ,m1,w(0,0,k),m1)
+         call mxm(us(0,0,k),m1,D ,m1,w(0,0,k),m1)
       enddo
       call add2(u,w,m3)
 
