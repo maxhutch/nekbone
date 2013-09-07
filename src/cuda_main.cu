@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include "cuda.h"
+#include "cublas_v2.h"
 #include <iostream>
 #include <unistd.h>
 #ifdef __PARA
@@ -51,6 +52,7 @@ int this_device;
 int already_setup = 0;
 
 cudaStream_t* streams;
+cublasHandle_t cublas_ctx;
 
 /** Initialize the cuda context, which includes picking a device */
 extern "C" int setup_cuda_(void){
@@ -167,6 +169,7 @@ extern "C" int setup_cuda_(void){
   streams = (cudaStream_t*) malloc(32 * sizeof(cudaStream_t));
   for (i = 0; i < 32; i++)
       cudaStreamCreate(streams + i);
+  cublasCreate(&cublas_ctx);
 
   return EXIT_SUCCESS;
 }
@@ -176,6 +179,7 @@ extern "C" int setup_cuda_(void){
  * Only called in main.F
  */
 extern "C" int teardown_cuda_(void){
+  cublasDestroy(cublas_ctx);
   int i;
   for (i = 0; i < 32; i++)
     cudaStreamDestroy(streams[i]);

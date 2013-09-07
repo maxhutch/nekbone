@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include "cuda.h"
+#include "cublas_v2.h"
 #include "magma.h"
 #define gpuErrchk(ans) { gpuAssert((ans), __FILE__, __LINE__); }
 #define MIN(a,b) (((a)<(b))?(a):(b))
@@ -11,6 +12,7 @@ inline void gpuAssert(cudaError_t code, char *file, int line, bool abort=true)
        if (abort) exit(code);
    }
 }
+
 
 extern "C" void local_grad3_cuda_(double *ur,
                                  double *us, 
@@ -134,6 +136,26 @@ static __global__ void transform_k(double* ur,
   }
 }
 
+static __global__ void set_addr(double** batch_u,
+                                double** batch_us,
+				double** batch_Dt,
+				double** batch_D,
+				double* u,
+				double* us,
+				double* Dt,
+				double* D,
+				int size,
+				int num){
+  const int idx = threadIdx.x + blockIdx.x * blockDim.x;
+  const int nthreads = blockDim.x * gridDim.x;
+  int i;
+  for (i = idx; i < num; i+=nthreads){
+    batch_u[i] = u + i*size;
+    batch_us[i] = us + i*size;
+    batch_Dt[i] = Dt;
+    batch_D[i] = D;
+  }
+}
 
 extern "C" void local_grad3_comb_cuda_(double *w,
                                       double* u,
@@ -203,7 +225,9 @@ extern "C" void local_grad3_comb_cuda_(double *w,
 
 #define NUM_BLOCK_MAX 1
 #define NUM_STREAM_MAX 4
+#define USE_BATCH
 extern cudaStream_t* streams;
+extern cublasHandle_t cublas_ctx;
 extern "C" void ax_e_cuda_(double *w,
                                       double* u,
                                       double* D,
@@ -218,12 +242,17 @@ extern "C" void ax_e_cuda_(double *w,
   int i, j, jp;
 
   int num_block_l;
-  
+ 
+  const double zero = 0.0, one = 1.0;
+
   double *u_d, *D_d, *Dt_d, *g_d;
   double *ur_d, *us_d, *ut_d; 
   double *u_l, *ur_l, *us_l, *ut_l, *g_l;
-  
   double *u_h, *w_h, *g_h;
+
+  double **batch_Dt_d; double **batch_D_d;
+  double **batch_u_d; double **batch_us_d; 
+  double **batch_u_l; double **batch_us_l; 
 
   // First, copy over D, Dt
   gpuErrchk(cudaMalloc(&D_d , size2 * sizeof(double)))
@@ -242,34 +271,53 @@ extern "C" void ax_e_cuda_(double *w,
   gpuErrchk(cudaMalloc(&u_d , NUM_BLOCK_MAX * NUM_STREAM_MAX * size3 * sizeof(double)))
   gpuErrchk(cudaMalloc(&g_d , NUM_BLOCK_MAX * NUM_STREAM_MAX * 6 * size3 * sizeof(double)))
 
-  // Copy CPU memory into pinned buffers
-  gpuErrchk(cudaMallocHost((void**)&u_h, num*size3*sizeof(double)));
-  gpuErrchk(cudaMallocHost((void**)&w_h, num*size3*sizeof(double)));
-  gpuErrchk(cudaMallocHost((void**)&g_h, num*6*size3*sizeof(double)));
-  memcpy(u_h, u, num*size3*sizeof(double));
-  memcpy(w_h, w, num*size3*sizeof(double));
-  memcpy(g_h, g, num*6*size3*sizeof(double));
+  gpuErrchk(cudaMalloc(&batch_u_d , NUM_BLOCK_MAX * NUM_STREAM_MAX * size1 * sizeof(double*)))
+  gpuErrchk(cudaMalloc(&batch_us_d , NUM_BLOCK_MAX * NUM_STREAM_MAX * size1 * sizeof(double*)))
+  gpuErrchk(cudaMalloc(&batch_Dt_d , NUM_BLOCK_MAX * size1 * sizeof(double*)))
+  gpuErrchk(cudaMalloc(&batch_D_d , NUM_BLOCK_MAX * size1 * sizeof(double*)))
+
+  // Pin the input/output buffers in-place
+  u_h = u; w_h = w; g_h = g;
+  gpuErrchk(cudaHostRegister(u_h, num*size3*sizeof(double), 0));
+  gpuErrchk(cudaHostRegister(w_h, num*size3*sizeof(double), 0));
+  gpuErrchk(cudaHostRegister(g_h, num*6*size3*sizeof(double), 0));
 
   for (j = 0; j < num; j+=NUM_BLOCK_MAX){ 
     jp = (j/NUM_BLOCK_MAX) % NUM_STREAM_MAX;
     num_block_l = MIN(NUM_BLOCK_MAX, num-j*NUM_BLOCK_MAX);
     u_l = u_d + jp*size3; ur_l = ur_d + jp*size3; us_l = us_d + jp*size3; ut_l = ut_d + jp*size3;
     g_l = g_d + jp*6*size3;
+    batch_u_l = batch_u_d + jp*size1; batch_us_l = batch_us_d + jp*size1; 
     gpuErrchk(cudaMemcpyAsync(u_l, u_h+  j*size3,   size3*sizeof(double)*num_block_l, cudaMemcpyHostToDevice, streams[jp]))
     gpuErrchk(cudaMemcpyAsync(g_l, g_h+6*j*size3, 6*size3*sizeof(double)*num_block_l, cudaMemcpyHostToDevice, streams[jp]))
 
+#ifdef USE_BATCH
+    set_addr<<<1,32, 0, streams[jp]>>>(batch_u_l, batch_us_l, batch_Dt_d, batch_D_d,
+                                       u_l, us_l, Dt_d, D_d, 
+				       size2, size1*num_block_l);
+#endif
     // dgemm('N','N',n1,n3,n2,1.0,a,n1,b,n2,0.0,c,n1)
     magmablasSetKernelStream(streams[jp]);
+    cublasSetStream(cublas_ctx, streams[jp]);
     magma_dgemm('T', 'N', size1, size2*num_block_l, size1, 
                 1.0,  Dt_d, size1, 
                       u_l, size1,
                 0.0, ur_l, size1);
+#ifdef USE_BATCH
+    cublasDgemmBatched(cublas_ctx,
+                       CUBLAS_OP_N, CUBLAS_OP_N, size1, size1, size1,
+		       &one, (const double **) batch_u_l, size1,
+		             (const double **) batch_Dt_d, size1,
+		       &zero, batch_us_l, size1,
+		           size1*num_block_l);
+#else
     for (i = 0; i < size1*num_block_l; i++){
       magma_dgemm('N', 'N', size1, size1, size1,
                   1.0,  u_l + i*size2, size1,
                        Dt_d          , size1,
                   0.0, us_l + i*size2, size1);
     }
+#endif
     for (i = 0;i < num_block_l; i++){
     magma_dgemm('N', 'N', size2, size1, size1,
                 1.0, u_l +i*size3, size2,
@@ -283,12 +331,21 @@ extern "C" void ax_e_cuda_(double *w,
                 1.0, D_d, size1, 
                      ur_l, size1,
                 0.0,  u_l, size1);
+#ifdef USE_BATCH
+    cublasDgemmBatched(cublas_ctx,
+                       CUBLAS_OP_N, CUBLAS_OP_N, size1, size1, size1,
+		       &one, (const double **) batch_us_l, size1,
+		             (const double **) batch_D_d, size1,
+		       &one, batch_u_l, size1,
+		             size1*num_block_l);
+#else
     for (i = 0; i < size1*num_block_l; i++){
       magma_dgemm('N', 'N', size1, size1, size1,
                   1.0, us_l + i*size2, size1,
                         D_d          , size1,
 	          1.0,  u_l + i*size2, size1);
     }
+#endif
     for (i = 0; i < num_block_l; i++){
     magma_dgemm('N', 'N', size2, size1, size1,
                 1.0, ut_l + i*size3, size2,
@@ -299,16 +356,13 @@ extern "C" void ax_e_cuda_(double *w,
   }
   cudaDeviceSynchronize(); 
 
-  // Copy out of pinned buffers
-  memcpy(u, u_h, num*size3*sizeof(double));
-  memcpy(w, w_h, num*size3*sizeof(double));
-  memcpy(g, g_h, num*6*size3*sizeof(double));
-  gpuErrchk(cudaFreeHost(u_h));
-  gpuErrchk(cudaFreeHost(w_h));
-  gpuErrchk(cudaFreeHost(g_h));
- 
+  // Unpin the memcpy buffers
+  gpuErrchk(cudaHostUnregister(u_h));
+  gpuErrchk(cudaHostUnregister(w_h));
+  gpuErrchk(cudaHostUnregister(g_h));
 
   gpuErrchk(cudaFree(ur_d)) gpuErrchk(cudaFree(us_d)) gpuErrchk(cudaFree(ut_d)) gpuErrchk(cudaFree(u_d))
   gpuErrchk(cudaFree(D_d)) gpuErrchk(cudaFree(Dt_d)) gpuErrchk(cudaFree(g_d))
+  gpuErrchk(cudaFree(batch_u_d)) gpuErrchk(cudaFree(batch_us_d)) gpuErrchk(cudaFree(batch_Dt_d)) gpuErrchk(cudaFree(batch_D_d))
 }
 
