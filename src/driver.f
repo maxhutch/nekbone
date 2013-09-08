@@ -39,7 +39,7 @@ c     SET UP and RUN NEKBONE
 
            call proxy_setup(ah,bh,ch,dh,zpts,wght,g) 
 
-           niter = 10
+           niter = 100
            n     = nx1*ny1*nz1*nelt
 
            call set_f(f,c,n)
