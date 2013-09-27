@@ -1,6 +1,7 @@
 c-----------------------------------------------------------------------
-      subroutine cg(x,f,g,c,r,w,p,z,n,niter,flop_cg)
+      subroutine cg(x,f,g,c,r,w,p,z,n,niter,flop_cg_l)
       include 'SIZE'
+      include 'TOTAL'
 
 c     Solve Ax=f where A is SPD and is invoked by ax()
 c
@@ -44,7 +45,7 @@ c     set machine tolerances
       if (nid.eq.0)  write(6,6) iter,rnorm
 
 #ifdef USE_CUDA
-      call setup_cg_cuda(w,p,g,nx1-1,nelt)
+      call setup_cg_cuda(nx1, ny1, nz1, nelt, ldim, g, dxm1, dxtm1)
 #endif
 
       miter = niter
@@ -54,7 +55,6 @@ c     call tester(z,r,n)
 
          rtz2=rtz1                                                       ! OPS
          rtz1=glsc3(r,c,z,n)   ! parallel weighted inner product r^T C z ! 3n
-
          beta = rtz1/rtz2
          if (iter.eq.1) beta=0.0
          call add2s1(p,z,beta,n)                                         ! 2n
@@ -81,12 +81,12 @@ c        if (rtr.le.rlim2) goto 1001
  1001 continue
 
 #ifdef USE_CUDA
-      call teardown_cg_cuda(w,p,g,nx1-1,nelt)
+      call teardown_cg_cuda()
 #endif
 
       if (nid.eq.0) write(6,6) iter,rnorm,alpha,beta,pap
 
-      flop_cg = flop_cg + iter*15*n
+      flop_cg_l = flop_cg_l + iter*15*n
 
       return
       end
@@ -115,7 +115,8 @@ c-----------------------------------------------------------------------
 
       integer e
 #ifdef USE_CUDA
-      call ax_e_cuda(w, u,dxm1,dxtm1,gxyz,nx1-1,nelt)
+      call ax_e_cuda(nx1,ny1,nz1,nelt,ldim,w,u,gxyz,dxm1,dxtm1)
+      !w = u
 #else
       do e=1,nelt                                ! ~
          call ax_e( w(1,e),u(1,e),gxyz(1,1,e)    ! w   = A  u

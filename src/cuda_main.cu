@@ -112,13 +112,13 @@ extern "C" int setup_cuda_(void){
   best_device = -1;  best_mem = 0; best_used = 10000000;
   for (device = 0; device < deviceCount; device++){
     if (device_list[device].used < best_used &&
-        device_list[device].properties.major >= 2){
+        device_list[device].properties.major >= 3){
       best_device = device;
       best_mem = device_list[device].properties.totalGlobalMem;
       best_used = device_list[device].used;
     } else if (device_list[device].used == best_used &&
                device_list[device].properties.totalGlobalMem > best_mem &&
-               device_list[device].properties.major >= 2){
+               device_list[device].properties.major >= 3){
       best_device = device;
       best_mem = device_list[device].properties.totalGlobalMem;
       best_used = device_list[device].used;
