@@ -10,15 +10,11 @@ c     Maximum number of elements (limited to 2**31/12, at least for now)
 
       common /hcglb/ nvtot,nelgf(0:ldimt1)
      $              ,lglel(lelt)
-     $              ,gllel(lelg)
-     $              ,gllnid(lelg)
      $              ,nelgv,nelgt
 
-      integer        gllel,gllnid,lglel
+      integer        lglel
       integer*8      nvtot
 
-      common /diagl/  ifgprnt
-      logical ifgprnt
       common/precsn/ wdsize,isize,lsize,csize
       common/precsl/ ifdblas
       integer wdsize,isize,lsize,csize

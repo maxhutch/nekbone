@@ -649,22 +649,6 @@ c
       return
       end
 c-----------------------------------------------------------------------
-c     real function gl2norm(a,n)
-
-c     include 'SIZE'
-c     include 'MASS'
-
-c     real a(1)
-
-c     common /scrsf/ w1 (lx1,ly1,lz1,lelt)
-
-c     call col3 (w1,a,a,n)
-c     call col2 (w1,bm1,n)
-c     gl2norm = sqrt(glsum (w1,n)/volvm1)
-
-c     return
-c     end
-c-----------------------------------------------------------------------
       function glsum (x,n)
       DIMENSION X(1)
       DIMENSION TMP(1),WORK(1)

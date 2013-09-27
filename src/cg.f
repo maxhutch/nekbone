@@ -16,11 +16,10 @@ c     User-provided ax(w,z,n) returns  w := Az,
 c
 c     User-provided solveM(z,r,n) ) returns  z := M^-1 r,  
 c
+
+      common /mymask/cmask(-1:lx1*ly1*lz1*lelt)
       parameter (lt=lx1*ly1*lz1*lelt)
       real ur(lt),us(lt),ut(lt),wk(lt)
-
-c     parameter (lxyz=lx1*ly1*lz1)
-c     real ur(lxyz),us(lxyz),ut(lxyz),wk(lxyz)
 
       real x(n),f(n),r(n),w(n),p(n),z(n),g(1),c(n)
 
@@ -38,17 +37,18 @@ c     set machine tolerances
 
       call rzero(x,n)
       call copy (r,f,n)
-      call mask (r)   ! Zero out Dirichlet conditions
+      call maskit (r,cmask,nx1,ny1,nz1) ! Zero out Dirichlet conditions
 
       rnorm = sqrt(glsc3(r,c,r,n))
       iter = 0
-      if (nid.eq.0)write(6,6) iter,rnorm
+      if (nid.eq.0)  write(6,6) iter,rnorm
 
 #ifdef USE_CUDA
       call setup_cg_cuda(w,p,g,nx1-1,nelt)
 #endif
 
       miter = niter
+c     call tester(z,r,n)  
       do iter=1,miter
          call solveM(z,r,n)    ! preconditioner here
 
@@ -92,9 +92,11 @@ c        if (rtr.le.rlim2) goto 1001
       end
 c-----------------------------------------------------------------------
       subroutine solveM(z,r,n)
+      include 'INPUT'
       real z(n),r(n)
 
-      call copy(z,r,n)
+      nn = n
+      call h1mg_solve(z,r,nn)
 
       return
       end
@@ -104,12 +106,12 @@ c-----------------------------------------------------------------------
       include 'SIZE'
       include 'TOTAL'
 
-      parameter (lxyz=lx1*ly1*lz1)
-      real w(lxyz,lelt),u(lxyz,lelt),gxyz(2*ldim,lxyz,lelt)
+      real w(nx1*ny1*nz1,nelt),u(nx1*ny1*nz1,nelt)
+      real gxyz(2*ldim,nx1*ny1*nz1,nelt)
+
       parameter (lt=lx1*ly1*lz1*lelt)
       real ur(lt),us(lt),ut(lt),wk(lt)
-
-c      real ur(lxyz),us(lxyz),ut(lxyz),wk(lxyz)
+      common /mymask/cmask(-1:lx1*ly1*lz1*lelt)
 
       integer e
 #ifdef USE_CUDA
@@ -120,13 +122,13 @@ c      real ur(lxyz),us(lxyz),ut(lxyz),wk(lxyz)
      $                             ,ur,us,ut,wk) !  L     L  L
       enddo                                      ! 
 #endif
-      call gs_op(gsh,w,1,1,0)  ! Gather-scatter operation  ! w   = QQ  w
+      call dssum(w)         ! Gather-scatter operation  ! w   = QQ  w
                                                            !            L
-      call add2s2(w,u,.1,n)
-      call mask(w)             ! Zero out Dirichlet conditions
+      call add2s2(w,u,.1,n)   !2n
+      call maskit(w,cmask,nx1,ny1,nz1)  ! Zero out Dirichlet conditions
 
       nxyz=nx1*ny1*nz1
-      flop_a = flop_a + (15*nxyz+12*nx1*nxyz)*nelt
+      flop_a = flop_a + (19*nxyz+12*nx1*nxyz)*nelt
 
       return
       end
@@ -151,9 +153,9 @@ c-------------------------------------------------------------------------
       include 'TOTAL'
 
       parameter (lxyz=lx1*ly1*lz1)
-      real w(lxyz),u(lxyz),g(2*ldim,lxyz)
-
       real ur(lxyz),us(lxyz),ut(lxyz),wk(lxyz)
+      real w(nx1*ny1*nz1),u(nx1*ny1*nz1),g(2*ldim,nx1*ny1*nz1)
+
 
       nxyz = nx1*ny1*nz1
       n    = nx1-1
@@ -213,11 +215,158 @@ c     Output: ur,us,ut         Input:u,N,D,Dt
       return
       end
 c-----------------------------------------------------------------------
-      subroutine mask(w)   ! Zero out Dirichlet conditions
+      subroutine maskit(w,pmask,nx,ny,nz)   ! Zero out Dirichlet conditions
+      include 'SIZE'
+      include 'PARALLEL'
+
+      real pmask(-1:lx1*ly1*lz1*lelt)
+      real w(1)
+      integer e
+
+      nxyz = nx*ny*nz
+      nxy  = nx*ny
+      if(pmask(-1).lt.0) then
+        j=pmask(0)
+        do i = 1,j
+           k = pmask(i)
+           w(k)=0.0
+        enddo
+      else
+c         Zero out Dirichlet boundaries.
+c
+c                      +------+     ^ Y
+c                     /   3  /|     |
+c               4--> /      / |     |
+c                   +------+ 2 +    +----> X
+c                   |   5  |  /    /
+c                   |      | /    /
+c                   +------+     Z   
+c
+
+        nn = 0
+        do e  = 1,nelt
+          call get_face(w,nx,e)
+          do i = 1,nxyz
+             if(w(i).eq.0) then
+               nn=nn+1
+               pmask(nn)=i
+             endif
+          enddo
+        enddo     
+        pmask(-1) = -1.
+        pmask(0) = nn
+      endif
+
+
+      return
+      end
+c-----------------------------------------------------------------------
+      subroutine masko(w)   ! Old 'mask'
       include 'SIZE'
       real w(1)
 
       if (nid.eq.0) w(1) = 0.  ! suitable for solvability
+
+      return
+      end
+c-----------------------------------------------------------------------
+      subroutine masking(w,nx,e,x0,x1,y0,y1,z0,z1)
+c     Zeros out boundary
+      include 'SIZE'
+      integer e,x0,x1,y0,y1,z0,z1
+      real w(nx,nx,nx,nelt)
+      
+c       write(6,*) x0,x1,y0,y1,z0,z1
+      do k=z0,z1
+      do j=y0,y1
+      do i=x0,x1
+          w(i,j,k,e)=0.0
+      enddo
+      enddo
+      enddo
+      return
+      end
+c-----------------------------------------------------------------------
+      subroutine tester(z,r,n)
+c     Used to test if solution to precond. is SPD
+      real r(n),z(n)
+
+      do j=1,n
+         call rzero(r,n)
+         r(j) = 1.0
+         call solveM(z,r,n)
+         do i=1,n
+            write(79,*) z(i)
+         enddo
+      enddo
+      call exitt0
+      return
+      end
+c-----------------------------------------------------------------------
+      subroutine get_face(w,nx,ie)
+c     zero out all boundaries as Dirichlet
+c     to change, change this routine to only zero out 
+c     the nodes desired to be Dirichlet, and leave others alone.
+      include 'SIZE'
+      include 'PARALLEL'
+      real w(1)
+      integer nx,ie,nelx,nely,nelz
+      integer x0,x1,y0,y1,z0,z1
+      
+      x0=1
+      y0=1
+      z0=1
+      x1=nx
+      y1=nx
+      z1=nx
+      
+      nelxy=nelx*nely
+      ngl = lglel(ie)        !global element number
+
+      ir = 1+(ngl-1)/nelxy   !global z-count
+      iq = mod1(ngl,nelxy)   !global y-count
+      iq = 1+(iq-1)/nelx     
+      ip = mod1(ngl,nelx)    !global x-count
+
+c     write(6,1) ip,iq,ir,nelx,nely,nelz, nelt,' test it'
+c  1  format(7i7,a8)
+
+      if(mod(ip,nelx).eq.1.or.nelx.eq.1)   then  ! Face4
+         x0=1
+         x1=1
+         call masking(w,nx,ie,x0,x1,y0,y1,z0,z1)
+      endif
+      if(mod(ip,nelx).eq.0)               then   ! Face2
+         x0=nx
+         x1=nx
+         call masking(w,nx,ie,x0,x1,y0,y1,z0,z1)
+      endif
+
+      x0=1
+      x1=nx
+      if(mod(iq,nely).eq.1.or.nely.eq.1) then    ! Face1
+         y0=1
+         y1=1
+         call masking(w,nx,ie,x0,x1,y0,y1,z0,z1)
+      endif
+      if(mod(iq,nely).eq.0)              then    ! Face3
+         y0=nx
+         y1=nx
+         call masking(w,nx,ie,x0,x1,y0,y1,z0,z1)
+      endif
+
+      y0=1
+      y1=nx
+      if(mod(ir,nelz).eq.1.or.nelz.eq.1) then    ! Face5
+         z0=1
+         z1=1
+         call masking(w,nx,ie,x0,x1,y0,y1,z0,z1)
+      endif
+      if(mod(ir,nelz).eq.0)              then    ! Face6
+         z1=nx
+         z0=nx
+         call masking(w,nx,ie,x0,x1,y0,y1,z0,z1)
+      endif
 
       return
       end

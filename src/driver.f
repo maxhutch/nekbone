@@ -3,46 +3,57 @@ c-----------------------------------------------------------------------
       
       include 'SIZE'
       include 'TOTAL'
+      include 'SEMHAT'
       include 'mpif.h'
 
+      common /mymask/cmask(-1:lx1*ly1*lz1*lelt)
       parameter (lxyz = lx1*ly1*lz1)
       parameter (lt=lxyz*lelt)
 
-      real ah(lx1*lx1),bh(lx1),ch(lx1*lx1),dh(lx1*lx1)
-     $    ,zpts(2*lx1),wght(2*lx1)
-      
       real x(lt),f(lt),r(lt),w(lt),p(lt),z(lt),c(lt)
       real g(6,lt)
+      real mfloplist(1024), avmflop
+      integer icount  
 
       logical ifbrick
-      integer iel0,ielN   ! element range per proc.
-      integer nx0,nxN     ! poly. order range
+      integer iel0,ielN,ielD   ! element range per proc.
+      integer nx0,nxN,nxD      ! poly. order range
+      integer npx,npy,npz      ! processor decomp
+      integer mx ,my ,mz       ! element decomp
 
 #ifdef USE_CUDA
       call setup_cuda()
 #endif
 
       call iniproc(mpi_comm_world)    ! has nekmpi common block
-      call read_param(ifbrick,iel0,ielN,nx0,nxN)
+      call init_delay
+
+      call read_param(ifbrick,iel0,ielN,ielD,nx0,nxN,nxD,
+     $                               npx,npy,npz,mx,my,mz)
 
 c     GET PLATFORM CHARACTERISTICS
 c     iverbose = 1
 c     call platform_timer(iverbose)   ! iverbose=0 or 1
 
+      icount = 0
+
 c     SET UP and RUN NEKBONE
-      do nx1=nx0,nxN
+      do nx1=nx0,nxN,nxD
          call init_dim
-         do nelt=iel0,ielN
-           call init_mesh(ifbrick)
-           call proxy_setupds    (gsh)     ! Has nekmpi common block
+         do nelt=iel0,ielN,ielD
+           call init_mesh(ifbrick,cmask,npx,npy,npz,mx,my,mz)
+           call proxy_setupds    (gsh,nx1) ! Has nekmpi common block
            call set_multiplicity (c)       ! Inverse of counting matrix
 
-           call proxy_setup(ah,bh,ch,dh,zpts,wght,g) 
+           call proxy_setup(ah,bh,ch,dh,zh,wh,g) 
+           call h1mg_setup
 
            niter = 100
            n     = nx1*ny1*nz1*nelt
 
            call set_f(f,c,n)
+
+           if(nid.eq.0) write(6,*)
            call cg(x,f,g,c,r,w,p,z,n,niter,flop_cg)
 
            call nekgsync()
@@ -50,9 +61,25 @@ c     SET UP and RUN NEKBONE
            call set_timer_flop_cnt(0)
            call cg(x,f,g,c,r,w,p,z,n,niter,flop_cg)
            call set_timer_flop_cnt(1)
+
            call gs_free(gsh)
+           
+           icount = icount + 1
+           mfloplist(icount) = mflops*np
          enddo
       enddo
+
+      avmflop = 0.0
+      do i = 1,icount
+         avmflop = avmflop+mfloplist(i)
+      enddo
+      if(icount.ne.0) then
+         avmflop=avmflop/icount
+      endif
+      if(nid.eq.0) then
+         write(6,1) avmflop
+      endif
+  1   format('Avg MFlops = ',1pe12.4)
 
 c     TEST BANDWIDTH BISECTION CAPACITY
 c     call xfer(np,cr_h)
@@ -85,7 +112,6 @@ c-----------------------------------------------------------------------
 C     Transfer array dimensions to common
 
       include 'SIZE'
-      include 'INPUT'
  
       ny1=nx1
       nz1=nx1
@@ -95,51 +121,139 @@ C     Transfer array dimensions to common
       return
       end
 c-----------------------------------------------------------------------
-      subroutine init_mesh(ifbrick)
+      subroutine init_mesh(ifbrick,cmask,npx,npy,npz,mx,my,mz)
       include 'SIZE'
       include 'TOTAL'
+      real cmask(-1:nx1*ny1*nz1*nelt)
       logical ifbrick
-      integer e,eg,offs
+      integer e,eg,offs,npx,npy,npz,mx,my,mz
  
+c     Trigger reset of mask
+      cmask(-1) = 1.0
 
       if(.not.ifbrick) then   ! A 1-D array of elements of length P*lelt
-  10     continue
          nelx = nelt*np
          nely = 1
          nelz = 1
+
+         npx=np
+         npy=1
+         npz=1
+
+         mx=nelt
+         my=1
+         mz=1
+
+         if(nid.eq.0) then 
+           write(6,*)
+           write(6,*) 'Processor Distribution:  npx,npy,npz=',npx,
+     $                npy,npz
+           write(6,*) 'Element Distribution: nelx,nely,nelz=',nelx,
+     $                nely,nelz
+           write(6,*) 'Local Element Distribution: mx,my,mz=',mx,
+     $                my,mz
+         endif
    
          do e=1,nelt
             eg = e + nid*nelt
             lglel(e) = eg
          enddo
       else              ! A 3-D block of elements 
-        call cubic(npx,npy,npz,np)  !xyz distribution of total proc
-        call cubic(mx,my,mz,nelt)   !xyz distribution of elements per proc
+         !xyz distribution of total proc if user-provided isn't valid
+         if(npx*npy*npz.ne.np) then
+            call cubic(npx,npy,npz,np) 
+         endif
+
+         !xyz distribution of total NELT if user-provided isn't valid
+         if(mx*my*mz.ne.nelt)  then
+            call cubic(mx,my,mz,nelt) 
+         endif
       
-        if(mx.eq.nelt) goto 10
+         nelx = mx*npx
+         nely = my*npy 
+         nelz = mz*npz
 
-        nelx = mx*npx
-        nely = my*npy 
-        nelz = mz*npz
+         if(nid.eq.0) then 
+           write(6,*)
+           write(6,*) 'Processor Distribution:  npx,npy,npz=',npx,
+     $                npy,npz
+           write(6,*) 'Element Distribution: nelx,nely,nelz=',nelx,
+     $                nely,nelz
+           write(6,*) 'Local Element Distribution: mx,my,mz=',mx,
+     $                my,mz
+         endif
 
-        e = 1
-        offs = (mod(nid,npx)*mx) + npx*(my*mx)*(mod(nid/npx,npy)) 
-     $      + (npx*npy)*(mx*my*mz)*(nid/(npx*npy))
-        do k = 0,mz-1
-        do j = 0,my-1
-        do i = 0,mx-1
-           eg = offs+i+(j*nelx)+(k*nelx*nely)+1
-           lglel(e) = eg
-           e        = e+1
-        enddo
-        enddo
-        enddo
+         e = 1
+         offs = (mod(nid,npx)*mx) + npx*(my*mx)*(mod(nid/npx,npy)) 
+     $       + (npx*npy)*(mx*my*mz)*(nid/(npx*npy))
+         do k = 0,mz-1
+         do j = 0,my-1
+         do i = 0,mx-1
+            eg = offs+i+(j*nelx)+(k*nelx*nely)+1
+            lglel(e) = eg
+            e        = e+1
+         enddo
+         enddo
+         enddo
       endif
 
       return
       end
 c-----------------------------------------------------------------------
       subroutine cubic(mx,my,mz,np)
+
+      mx = np
+      my = 1
+      mz = 1
+      ratio = np
+
+      iroot3 = np**(1./3.) + 0.000001
+      do i = iroot3,1,-1
+        iz = i
+        myx = np/iz
+        nrem = np-myx*iz
+
+        if (nrem.eq.0) then
+          iroot2 = myx**(1./2.) + 0.000001
+          do j=iroot2,1,-1
+            iy = j
+            ix = myx/iy
+            nrem = myx-ix*iy
+            if (nrem.eq.0) goto 20
+          enddo
+   20     continue
+
+          if (ix.lt.iy) then
+            it = ix
+            ix = iy
+            iy = it
+          endif
+
+          if (ix.lt.iz) then
+            it = ix
+            ix = iz
+            iz = it
+          endif
+
+          if (iy.lt.iz) then
+            it = iy
+            iy = iz
+            iz = it
+          endif
+
+          if ( REAL(ix)/iz.lt.ratio) then
+            ratio = REAL(ix)/iz
+            mx = ix
+            my = iy
+            mz = iz
+          endif
+        endif
+      enddo
+
+      return
+      end
+c-----------------------------------------------------------------------
+      subroutine cubic0(mx,my,mz,np)
 
         rp = np**(1./3.)
         mz = rp*(1.01)
@@ -173,6 +287,7 @@ c-----------------------------------------------------------------------
       n = nx1*ny1*nz1*nelt
 
       call rone(c,n)
+      call adelay
       call gs_op(gsh,c,1,1,0)  ! Gather-scatter operation  ! w   = QQ  w
 
       do i=1,n
@@ -196,8 +311,18 @@ c-----------------------------------------------------------------------
       else
         time1   = dnekclock()-time0
         if (time1.gt.0) mflops = (flop_a+flop_cg)/(1.e6*time1)
-        if (nid.eq.0) write(6,1) mflops,flop_a,flop_cg,time1,nelt,np,nx1
-    1   format(1p4e12.4,' flops',3i7)
+        if (nid.eq.0) then
+          write(6,*)
+          write(6,1) nelt,np,nx1, nelt*np
+          write(6,2) mflops*np, mflops
+          write(6,3) flop_a,flop_cg
+          write(6,4) time1
+        endif
+    1   format('nelt = ' i7, ', np = ', i9 ', nx1 = ', i7,
+     &         ', elements =', i10 )
+    2   format('Tot MFlops = ', 1pe12.4, ', MFlops      = ', e12.4)
+    3   format('Setup Flop = ', 1pe12.4, ', Solver Flop = ', e12.4)
+    4   format('Solve Time = ', e12.4)
       endif
 
       return
@@ -281,37 +406,87 @@ c-----------------------------------------------------------------------
       return
       end
 c----------------------------------------------------------------------
-      subroutine read_param(ifbrick,iel0,ielN,nx0,nxN)
+      subroutine read_param(ifbrick,iel0,ielN,ielD,nx0,nxN,nxD,
+     $                                     npx,npy,npz,mx,my,mz)
       include 'SIZE'
+      include 'INPUT'
+      include 'HSMG'
       logical ifbrick
-      integer iel0,ielN,nx0,nxN
+      integer iel0,ielN,ielD,nx0,nxN,nxD,npx,npy,npz,mx,my,mz
 
       !open .rea
+      ifbrick = .false.  
+      ifmgrid = .false.  !initialize to false
+
       if(nid.eq.0) then
          open(unit=9,file='data.rea',status='old') 
          read(9,*,err=100) ifbrick
-         read(9,*,err=100) iel0,ielN
-c        read(9,*,err=100) nx0,nxN
+         read(9,*,err=100) iel0,ielN,ielD
+         read(9,*,err=100) nx0,nxN,nxD
+         read(9,*,err=100) npx,npy,npz
+         read(9,*,err=100) mx,my,mz
          close(9)
+#if 0
+         if(ifbrick.eq.'T'.or.ifbrick.eq.'t') then
+             ifbrick = .true.
+         elseif(ifbrick.eq.'F'.or.ifbrick.eq.'f') then
+             ifbrick = .false.
+         endif
+#endif
       endif
       call bcast(ifbrick,4)
-      call bcast(iel0,4)
+
+      call bcast(iel0,4)! ELEMENT range
       call bcast(ielN,4)
-      nx0=lx1
-      nxN=lx1
-c     call bcast(nx0,4)
-c     call bcast(nxN,4)
-      if(iel0.gt.ielN.or.nx0.gt.nxN) goto 200
+      call bcast(ielD,4)
+
+      call bcast(nx0,4) ! POLY Order range
+      call bcast(nxN,4)
+      call bcast(nxD,4)
+
+      call bcast(npx,4) ! PROC decomp
+      call bcast(npy,4)
+      call bcast(npz,4)
+
+      call bcast(mx,4)  ! NELT decomp
+      call bcast(my,4)
+      call bcast(mz,4)
+
+#ifdef MGRID
+      ifmgrid = .true.
+#endif
+
+      if(iel0.gt.ielN.or.nx0 .gt.nxN)    goto 200
+      if(ielN.gt.lelt.or.nxN .gt.lx1)    goto 210
+      if(ielD.gt.ielN.or.nxD.gt.nxN)     goto 220
+      if(nx0.lt.4.and.ifmgrid) goto 230
+
+      if(nid.eq.0) write(6,*) "ifmgrid    :",ifmgrid
+     $                   ,"    ifbrick    :",ifbrick
 
       return
 
   100 continue
-      write(6,*) "ERROR READING data.rea....ABORT"
+      write(6,*) "ERROR READING    data.rea.....ABORT"
+      write(6,*) "CHECK PARAMETERS data.rea.....ABORT"
       call exitt0
 
   200 continue
       write(6,*) "ERROR data.rea :: iel0 > ielN or nx0 > nxN :: ABORT"
       call exitt0
+
+  210 continue
+      write(6,*) "ERROR data.rea : ielN>lelt or nxN>lx1(SIZE) :: ABORT"
+      call exitt0
+  
+  220 continue
+      write(6,*) "WARNING data.rea : STRIDE   nxD>nxN or ielD>ielN !!!"
+  
+  230 continue
+      write(6,*) "ERROR data.rea nx0 must be greater than or equal to 4"
+     $          ," ...setting nx0=4"
+      nx0=4
+  
   
       return
       end

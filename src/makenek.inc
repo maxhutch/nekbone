@@ -9,6 +9,9 @@ if [ "$PPLIST" == "?" ]; then
   echo "available pre-processor symbols:" 
   echo "  BG        enable Blue Gene optimizations (BG/L and BG/P)"
   echo "  K10_MXM   use optimized MxM kernel for AMD Family 10h processors" 
+  echo "  NEKCOMM  nekbone communication test"
+  echo "  NEKDLAY  nekbone load imbalance simmulation"
+  echo "  MGRID    turns on Multigrid precondition"
   exit 1
 fi
 
@@ -28,6 +31,10 @@ CASEDIR=`pwd`
 APATH_SRC=`cd $SOURCE_ROOT; pwd`
 SOURCE_ROOT=$APATH_SRC
 
+NEKCOMM=false
+NEKDELAY=false
+MGRID=false
+
 # do some basic checks
 if [ "$CASEDIR" == "$SOURCE_ROOT" ]; then
    echo "FATAL ERROR: Working directory has to be different from the source!"
@@ -39,8 +46,8 @@ if [ ! -f SIZE ]; then
    exit 1
 fi
 
-if [ ! -f ./makefile.template ]; then
-  echo "FATAL ERROR: Cannot find ./makefile.template!"
+if [ ! -f $SOURCE_ROOT/makefile.template ]; then
+  echo "FATAL ERROR: Cannot find  $SOURCE_ROOT/makefile.template!"
   exit 1
 fi
 
@@ -147,7 +154,7 @@ fi
 case $F77comp in
   *pgf*)        P="-r8 -Mpreprocess"
                ;;
-  *gfortran*)   P="-fcray-pointer -fdefault-real-8 -x f77-cpp-input"
+  *gfortran*)   P="-fdefault-real-8 -x f77-cpp-input"
                ;;
   *ifort*)      P="-r8 -fpconstant -fpp"
                ;;
@@ -228,6 +235,18 @@ echo $PPLIST | grep 'BLAS_MXM' >/dev/null
 if [ $? -eq 0 ]; then
    MXM_USER="mxm_std.o" 
 fi
+for i in $PPLIST
+do
+if [ "$i" == "NEKCOMM" ]; then
+     IFNEKCOMM=true
+fi
+if [ "$i" == "NEKDLAY" ]; then
+     IFNEKDLAY=true
+fi
+if [ "$i" == "MGRID" ]; then
+     IFMGRID=true
+fi
+done
 
 # set optimization flags
 L0="\$(G) -O0"
@@ -271,12 +290,15 @@ sed -e "s:^F77[ ]*=.*:F77\:=$F77:" \
 -e "s/^L4[ ]*=.*/L4=$L4/" \
 -e "s/^PPPO[ ]*=.*/PPPO=$PPPO/" \
 -e "s/^PPS[ ]*=.*/PPS=$PPLIST/" \
--e "s:^MXM[ ]*=.*:MXM=$MXM_USER:" \
+-e "s/^IFNEKCOMM[ ]*=.*/IFNEKCOMM:=$IFNEKCOMM/" \
+-e "s/^IFNEKDLAY[ ]*=.*/IFNEKDLAY:=$IFNEKDLAY/" \
+-e "s/^IFMGRID[ ]*=.*/IFMGRID:=$IFMGRID/" \
 -e "s/^IFMPI[ ]*=.*/IFMPI:=$IFMPI/" \
 -e "s/^IFCUDA[ ]*=.*/IFCUDA:=$IFCUDA/" \
+-e "s:^MXM[ ]*=.*:MXM=$MXM_USER:" \
 -e "s:^USR[ ]*=.*:USR\:=$USR:" \
 -e "s:^USR_LFLAGS[ ]*=.*:USR_LFLAGS\:=$USR_LFLAGS:" \
--e "s:^S[ ]*=.*:S\:=${SOURCE_ROOT}:" ./makefile.template >.makefile
+-e "s:^S[ ]*=.*:S\:=${SOURCE_ROOT}:"  $SOURCE_ROOT/makefile.template >.makefile
 
 echo $G | grep '\-g' 1>/dev/null
 if [ $? -eq 0 ]; then

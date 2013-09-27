@@ -16,7 +16,8 @@ NVCC="/opt/cuda/5.5/bin/nvcc -gencode=arch=compute_10,code=sm_10 -gencode=arch=c
 
 # pre-processor symbol list 
 # (set PPLIST=? to get a list of available symbols)
-#PPLIST="?" 
+# NEKCOMM, NEKDLAY, BG, MGRID
+#PPLIST="?"
 
 
 # OPTIONAL SETTINGS
@@ -26,7 +27,7 @@ NVCC="/opt/cuda/5.5/bin/nvcc -gencode=arch=compute_10,code=sm_10 -gencode=arch=c
 #IFMPI="false"
 
 # enable CUDA (default false)
-IFCUDA="true"
+#IFCUDA="true"
 
 # auxilliary files to compile
 # NOTE: source files have to located in the same directory as makenek
