@@ -26,6 +26,8 @@
 #define gs_free    PREFIXED_NAME(gs_free  )
 #define gs_unique  PREFIXED_NAME(gs_unique)
 
+
+
 GS_DEFINE_DOM_SIZES()
 
 typedef enum { mode_plain, mode_vec, mode_many,

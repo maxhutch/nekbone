@@ -14,7 +14,7 @@ CC="mpicc"
 # pre-processor symbol list 
 # (set PPLIST=? to get a list of available symbols)
 # NEKCOMM, NEKDLAY, BG, MGRID
-#PPLIST="?"
+PPLIST="MGRID"
 
 
 # OPTIONAL SETTINGS

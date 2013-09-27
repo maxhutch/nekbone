@@ -102,6 +102,7 @@ c
       real x(n), w(n)
       character*3 op
 c
+      call adelay
       if (op.eq.'+  ') then
          call mpi_allreduce (x,w,n,nekreal,mpi_sum ,nekcomm,ierr)
       elseif (op.EQ.'M  ') then
@@ -130,6 +131,7 @@ c
       integer x(n), w(n)
       character*3 op
 
+      call adelay
       if     (op.eq.'+  ') then
         call mpi_allreduce (x,w,n,mpi_integer,mpi_sum ,nekcomm,ierr)
       elseif (op.EQ.'M  ') then
@@ -158,6 +160,7 @@ c
       integer*8 x(n), w(n)
       character*3 op
 
+      call adelay
       if     (op.eq.'+  ') then
         call mpi_allreduce (x,w,n,mpi_integer8,mpi_sum ,nekcomm,ierr)
       elseif (op.EQ.'M  ') then
@@ -195,6 +198,7 @@ C
       len = lenm
       jnid = mpi_any_source
 
+      call adelay
       call mpi_recv (buf,len,mpi_byte
      $              ,jnid,mtype,nekcomm,status,ierr)
 c
@@ -215,6 +219,7 @@ C
       len = lenm
       jnid = mpi_any_source
 
+      call adelay
       call mpi_recv (buf,len,mpi_byte
      $            ,jnid,mtype,nekcomm,status,ierr)
       call mpi_get_count (status,mpi_byte,len,ierr)
@@ -278,6 +283,7 @@ C
 
       item=0
       if (ifif) item=1
+      call adelay
       call bcast(item,isize)
       ifif=.false.
       if (item.eq.1) ifif=.true.
@@ -290,6 +296,7 @@ c-----------------------------------------------------------------------
       common /nekmpi/ nid,np,nekcomm,nekgroup,nekreal
       real*4 buf(1)
 
+      call adelay
       call mpi_bcast (buf,len,mpi_byte,0,nekcomm,ierr)
 
       return
@@ -319,6 +326,7 @@ C
       include 'mpif.h'
       common /nekmpi/ nid,np,nekcomm,nekgroup,nekreal
 C
+      call adelay
       call mpi_isend (x,len,mpi_byte,jnid,msgtag
      $       ,nekcomm,imsg,ierr)
       isend = imsg
@@ -336,6 +344,7 @@ C
       include 'mpif.h'
       common /nekmpi/ nid,np,nekcomm,nekgroup,nekreal
 C
+      call adelay
       call mpi_irecv (x,len,mpi_byte,mpi_any_source,msgtag
      $       ,nekcomm,imsg,ierr)
       irecv = imsg
@@ -353,6 +362,7 @@ c
 c
 c     write(6,*) nid,' msgwait:',imsg
 c
+      call adelay
       call mpi_wait (imsg,status,ierr)
 c
       return
@@ -363,6 +373,7 @@ c-----------------------------------------------------------------------
       include 'mpif.h'
       common /nekmpi/ nid,np,nekcomm,nekgroup,nekreal
 
+      call adelay
       call mpi_barrier(nekcomm,ierr)
 
       return
@@ -480,10 +491,6 @@ c
          dtmp2 = 0
          dtmp3 = 0
          if(istep.gt.0) then
-           dgp   = nvtot
-           dgp   = max(dgp,1.)
-           dtmp1 = np*ttime/(dgp*max(istep,1))
-           dtmp2 = ttime/max(istep,1)
            dtmp3 = 1.*papi_flops/1e6
          endif 
          write(6,*) ' '
@@ -491,11 +498,8 @@ c
          write(6,*) ' '
 c        call print_stack()
          write(6,*) ' '
-         write(6,'(4(A,1p1e13.5,A,/))') 
+         write(6,'(1(A,1p1e13.5,A,/))') 
      &       'total elapsed time             : ',ttotal, ' sec'
-     &      ,'total solver time incl. I/O    : ',ttime , ' sec'
-     &      ,'time/timestep                  : ',dtmp2 , ' sec'
-     &      ,'CPU seconds/timestep/gridpt    : ',dtmp1 , ' sec'
 #ifdef PAPI
          write(6,'(2(A,1g13.5,/))') 
      &       'Gflops                         : ',dtmp3/1000.

@@ -5,7 +5,7 @@ c-----------------------------------------------------------------------
       include 'TOTAL'
 
       real a(lx1*lx1),b(lx1),c(lx1*lx1),d(lx1*lx1),z(lx1)
-     $               , w(lx1*2),g(6,lx1*ly1*lz1*lelt)
+     $               , w(lx1*2),g(6,nx1*ny1*nz1*nelt)
 
       call semhat(a,b,c,d,z,w,nx1-1)
 
@@ -28,7 +28,7 @@ c-------------------------------------------------------------------------
 
       include 'SIZE'
       include 'TOTAL'
-      real g(6,lx1,ly1,lz1,lelt)
+      real g(6,nx1,ny1,nz1,nelt)
       integer e
 
       n = nx1*ny1*nz1*nelt
