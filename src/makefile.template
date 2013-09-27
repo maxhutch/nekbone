@@ -9,8 +9,10 @@ IFMPI=
 IFNEKCOMM=
 IFNEKDLAY=
 IFMGRID=
+IFCUDA= 
 F77=
 CC=
+NVCC=
 P=
 PPPO=
 PPS=
@@ -50,6 +52,15 @@ endif
 # MXM 
 MXM = mxm_std.o
 
+################################################################################
+# CUDA
+ifeq ($(IFCUDA), true)
+  CUDA = cuda_main.o cuda_ax.o
+  PPS_F += -DUSE_CUDA
+else
+  CUDA = 
+endif
+
 # JL Routines ###################################################################
 JO  = jl_
 JL := -DPREFIX=jl_
@@ -70,7 +81,7 @@ else
 endif
 
 #####################################################################################
-TMPBON = $(BONE) $(COMM_MPI) $(MXM)
+TMPBON = $(BONE) $(COMM_MPI) $(MXM) $(CUDA)
 NOBJS_Fbon = $(patsubst %,$(OBJDIR)/%,$(TMPBON))
 
 TMP0c = $(JLCORE)
@@ -138,6 +149,9 @@ $(OBJDIR)/comm_mpi.o	:$S/comm_mpi.f;			$(F77) -c $(FL2) $< -o $@
 $(OBJDIR)/mpi_dummy.o	:$S/mpi_dummy.f;		$(F77) -c $(FL2) $< -o $@
 $(OBJDIR)/delay.o	:$S/delay.f;			$(F77) -c $(FL2) $< -o $@
 $(OBJDIR)/delay_dum.o	:$S/delay_dum.f;		$(F77) -c $(FL2) $< -o $@
+# CUDA      ############################################################################
+$(OBJDIR)/cuda_main.o	:$S/cuda_main.cu;		$(NVCC) -c $(G) $< -o $@
+$(OBJDIR)/cuda_ax.o	:$S/cuda_ax.cu;		$(NVCC) -c $(G) $< -o $@
 # MXM       ############################################################################
 $(OBJDIR)/mxm_wrapper.o	  :$S/mxm_wrapper.f;		$(F77) -c $(FL2) $< -o $@ 
 $(OBJDIR)/mxm_std.o	  :$S/mxm_std.f;		$(F77) -c $(FL4) $< -o $@
