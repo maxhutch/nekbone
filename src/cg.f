@@ -45,7 +45,7 @@ c     set machine tolerances
       if (nid.eq.0)  write(6,6) iter,rnorm
 
 #ifdef USE_CUDA
-      call setup_cg_cuda(nx1, ny1, nz1, nelt, ldim, g, dxm1, dxtm1)
+      call setup_cg_cuda(w,p,g,nx1-1,nelt)
 #endif
 
       miter = niter
@@ -81,7 +81,7 @@ c        if (rtr.le.rlim2) goto 1001
  1001 continue
 
 #ifdef USE_CUDA
-      call teardown_cg_cuda()
+      call teardown_cg_cuda(w,p,g,nx1-1,nelt)
 #endif
 
       if (nid.eq.0) write(6,6) iter,rnorm,alpha,beta,pap
@@ -115,7 +115,7 @@ c-----------------------------------------------------------------------
 
       integer e
 #ifdef USE_CUDA
-      call ax_e_cuda(nx1,ny1,nz1,nelt,ldim,w,u,gxyz,dxm1,dxtm1)
+      call ax_e_cuda(w, u,dxm1,dxtm1,gxyz,nx1-1,nelt)
 #else
       do e=1,nelt                                ! ~
          call ax_e( w(1,e),u(1,e),gxyz(1,1,e)    ! w   = A  u
