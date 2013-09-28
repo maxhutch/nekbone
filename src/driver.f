@@ -36,6 +36,7 @@ c     iverbose = 1
 c     call platform_timer(iverbose)   ! iverbose=0 or 1
 
       icount = 0
+      write(6,5) 'nelt', 'nx1', 'MFlops', 'FlopSet', 'FlopSlv'
 
 c     SET UP and RUN NEKBONE
       do nx1=nx0,nxN,nxD
@@ -80,6 +81,8 @@ c     SET UP and RUN NEKBONE
          write(6,1) avmflop
       endif
   1   format('Avg MFlops = ',1pe12.4)
+  5   format('| ' A7,' | ' A7,' | ' A12,
+     &       ' | ', A12, ' | ', A12, ' | ')
 
 c     TEST BANDWIDTH BISECTION CAPACITY
 c     call xfer(np,cr_h)
@@ -317,12 +320,15 @@ c-----------------------------------------------------------------------
           write(6,2) mflops*np, mflops
           write(6,3) flop_a,flop_cg
           write(6,4) time1
+          write(6,5) nelt, nx1, mflops, flop_a, flop_cg
         endif
     1   format('nelt = ' i7, ', np = ', i9 ', nx1 = ', i7,
      &         ', elements =', i10 )
     2   format('Tot MFlops = ', 1pe12.4, ', MFlops      = ', e12.4)
     3   format('Setup Flop = ', 1pe12.4, ', Solver Flop = ', e12.4)
     4   format('Solve Time = ', e12.4)
+    5   format('| ' i7,' | ' i7,' | ' e12.4,
+     &         ' | ', e12.4, ' | ', e12.4, ' | ')
       endif
 
       return

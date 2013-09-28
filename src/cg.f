@@ -86,7 +86,7 @@ c        if (rtr.le.rlim2) goto 1001
 
       if (nid.eq.0) write(6,6) iter,rnorm,alpha,beta,pap
 
-      flop_cg_l = flop_cg_l + iter*15*n
+      flop_cg_l = flop_cg_l + iter*15.*n
 
       return
       end
@@ -116,7 +116,6 @@ c-----------------------------------------------------------------------
       integer e
 #ifdef USE_CUDA
       call ax_e_cuda(nx1,ny1,nz1,nelt,ldim,w,u,gxyz,dxm1,dxtm1)
-      !w = u
 #else
       do e=1,nelt                                ! ~
          call ax_e( w(1,e),u(1,e),gxyz(1,1,e)    ! w   = A  u
