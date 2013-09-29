@@ -45,7 +45,7 @@ c     set machine tolerances
       if (nid.eq.0)  write(6,6) iter,rnorm
 
 #ifdef USE_CUDA
-      call setup_cg_cuda(w,p,g,nx1-1,nelt)
+      call setup_cg_cuda(w, p, g, dxm1, dxtm1, nx1-1, nelt)
 #endif
 
       miter = niter
