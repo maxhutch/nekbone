@@ -287,10 +287,8 @@ extern "C" void ax_e_cuda_(double *w,
   double **batch_us_d; double **batch_us_l; 
   double **batch_ut_d; double **batch_ut_l; 
 
-
-
 #ifdef USE_BATCH
-  if (size1 != 12){
+  if (!(size1 == 12 || size1 == 16)){
     gpuErrchk(cudaMalloc(&batch_u_d , NUM_BLOCK_MAX * NUM_STREAM_MAX * size1 * sizeof(double*)))
     gpuErrchk(cudaMalloc(&batch_us_d , NUM_BLOCK_MAX * NUM_STREAM_MAX * size1 * sizeof(double*)))
     gpuErrchk(cudaMalloc(&batch_u2_d , NUM_BLOCK_MAX * NUM_STREAM_MAX * sizeof(double*)))
@@ -322,6 +320,22 @@ extern "C" void ax_e_cuda_(double *w,
       // We could play with this
       const int pts_per_thread = 4;  // 6*288 = 12*12*12
       const int slab_size = 3;
+
+      const int grid_size = num_block_l;
+
+      ax_cuda_maxhutch<p,p_sq,p_cube,p_cube_padded,pts_per_thread,slab_size,cta_size>
+      <<<grid_size,cta_size, 0, streams[jp]>>>(u_l, g_l, D_d, Dt_d, num_block_l);
+    } else if (size1 == 16) {
+      // 12x12x12 case
+      const int cta_size = 16*16;
+      const int p = 16;
+      const int p_sq = 16*16;
+      const int p_cube = 16*16*16;
+      const int p_cube_padded = p_cube;
+
+      // We could play with this
+      const int pts_per_thread = 16;  // 6*288 = 12*12*12
+      const int slab_size = 1;
 
       const int grid_size = num_block_l;
 
@@ -409,7 +423,7 @@ extern "C" void ax_e_cuda_(double *w,
   cudaDeviceSynchronize(); 
 
 #ifdef USE_BATCH
-  if (size1 != 12){
+  if (!(size1 == 12 || size1 == 16)){
     gpuErrchk(cudaFree(batch_u_d));
     gpuErrchk(cudaFree(batch_u2_d));
     gpuErrchk(cudaFree(batch_us_d));
