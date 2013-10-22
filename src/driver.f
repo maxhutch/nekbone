@@ -54,16 +54,16 @@ c     SET UP and RUN NEKBONE
            call cg_cuda_init(x,f,g,c,r,w,p,z,nx1,ny1,nz1,nelt,ldim,
      &                       dxm1,dxtm1,niter,flop_cg,gsh,nid)
 
-           !Run cg iterations on device and copy back to host r vector
-           call cg_cuda(r,1)
+           !Run cg iterations on host
+           call cg(x,f,g,c,r,w,p,z,n,niter,flop_cg)
 
            ! Copy gpu results for future comparison
            do it=1,n
              r_gpu(it) = r(it)
            end do
 
-           !Run cg iterations on host
-           call cg(x,f,g,c,r,w,p,z,n,niter,flop_cg)
+           !Run cg iterations on device and copy back to host r vector
+           call cg_cuda(r,1,flop_cg,flop_a)
 
            ! Compare the CPU and GPU solutions
            do it=1,n
@@ -75,27 +75,39 @@ c     SET UP and RUN NEKBONE
            ! Rerun with timing, without copying back to host
            call nekgsync()
 
-           call set_timer_flop_cnt(0)
-c          call summary_start()
-
-           write(6,*) '---------------------------------------------'
-           write(6,*) 'GPU RESULTS'
-           write(6,*) '---------------------------------------------'
-           !Run cg iterations on device
-           call cg_cuda(r,0)
-
-           write(6,*) '---------------------------------------------'
-           write(6,*) 'CPU RESULTS'
-           write(6,*) '---------------------------------------------'
-
+           if (nid .eq. 0) then
+              write(6,*) '---------------------------------------------'
+              write(6,*) 'CPU RESULTS'
+              write(6,*) '---------------------------------------------'
+           endif 
+              
            ! Run same computation on host
            call set_timer_flop_cnt(0)
            time_beg = dnekclock()
            call cg(x,f,g,c,r,w,p,z,n,niter,flop_cg)
            time_end = dnekclock()
-           write(6,*) "CPU time: ",time_beg-time_end
-           write(6,*) "---------------------------------------------"
+           if (nid .eq. 0) then
+              write(6,*) "CPU time: ",time_end-time_beg
+              write(6,*) "---------------------------------------------"
+           endif 
+           call set_timer_flop_cnt(1)
 
+           call set_timer_flop_cnt(0)
+c          call summary_start()
+
+           if (nid .eq. 0) then
+              write(6,*) '---------------------------------------------'
+              write(6,*) 'GPU RESULTS'
+              write(6,*) '---------------------------------------------'
+           endif 
+           !Run cg iterations on device
+           time_beg = dnekclock()
+           call cg_cuda(r,0,flop_cg,flop_a)
+           time_end = dnekclock()
+           if (nid .eq. 0) then
+              write(6,*) "GPU time: ",time_end-time_beg
+              write(6,*) "---------------------------------------------"
+           endif 
            call set_timer_flop_cnt(1)
 
 c          call summary_stop()
