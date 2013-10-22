@@ -28,6 +28,7 @@ struct gpu_domain
   double *d_dxm1; // differentiation matrix D
   double *d_dxtm1; // D^T
   double *d_temp; // temporary array
+  double *d_mask; // mask data
 
   double *reduced_value;
   cudaEvent_t reduced_value_event;
@@ -40,6 +41,7 @@ struct gpu_domain
   int nxyz;
   int nid;
   int niter;
+  int mask_length;
 
   uint size_from[2];
   uint size_to[2];
@@ -212,12 +214,14 @@ void local_scatter_cuda(double* out, const double* in,
 }
 
 __global__
-void mask_kernel(double* w, int size)
+void mask_kernel(double* w, int size, double* mask)
 {
   int tid = threadIdx.x + blockDim.x*blockIdx.x;
-  if (tid < size)
-  {
-    w[tid] = 0.;
+  int nthreads = blockDim.x*gridDim.x;
+  int i, j;
+  for (i = tid; i < size; i += nthreads){
+    j = ((int) mask[i]) - 1;
+    w[j] = 0.;
   }
 }
 
@@ -3104,11 +3108,11 @@ void add2s1_cuda(double *a, double *b, double c1, int n)
 }
 
 
-void mask_cuda(double *w, int nid)
+void mask_cuda(double *w, int nid, double* mask, int mask_length)
 {
-  if (nid == 0)
+  if (1 || nid == 0)
   {
-    mask_kernel<<<1,1>>>(w,1);
+    mask_kernel<<<1,128>>>(w,mask_length, mask);
   }
 }
 
@@ -3250,7 +3254,7 @@ void solveM_cuda(double *z, double* r, int n)
   copy_cuda(z,r,n);
 }
 
-void axcuda(double* w, double* u, double *g, double *dxm1, double* dxtm1, int nx1, int ny1, int nz1, int nelt, int ldim, int nid)
+void axcuda(double* w, double* u, double *g, double *dxm1, double* dxtm1, int nx1, int ny1, int nz1, int nelt, int ldim, int nid, double* mask, int mask_length)
 {
 
   axcuda_e(w,u,g,dxm1,dxtm1,nx1,ny1,nz1,nelt,ldim);
@@ -3260,7 +3264,7 @@ void axcuda(double* w, double* u, double *g, double *dxm1, double* dxtm1, int nx
 
   int n = nx1*ny1*nz1*nelt;
   add2s2_cuda(w,u,.1,n);
-  mask_cuda(w,nid);
+  mask_cuda(w,nid, mask, mask_length);
 }
 
 
@@ -3278,7 +3282,9 @@ extern "C"
   }
 
 
-  void cg_cuda_init_(double* x, double* f, double* g, double* c, double* r, double* w, double* p, double* z, int* nx1, int* ny1, int* nz1, int* nelt, int* ldim, double* dxm1, double* dxtm1, int* niter, double* flop_cg, const int *gsh_handle, int* nid)
+  void cg_cuda_init_(double* x, double* f, double* g, double* c, double* r, double* w, double* p, double* z, 
+                     double* cmask,
+                     int* nx1, int* ny1, int* nz1, int* nelt, int* ldim, double* dxm1, double* dxtm1, int* niter, double* flop_cg, const int *gsh_handle, int* nid)
   {
     // Initialize gpu_dom structure
     // Note: the gsh structure on the GPU is already initialized, since gs_cuda_setup is called in the proxy_setupds function in driver.f
@@ -3290,6 +3296,8 @@ extern "C"
     gpu_dom.ldim= (*ldim);
     gpu_dom.nelt = (*nelt);
     gpu_dom.niter = (*niter);
+    gpu_dom.mask_length = (int) cmask[1];
+    //printf("mask_length = %d \n", gpu_dom.mask_length);
 
     int nxyz = (*nx1)*(*ny1)*(*nz1);
     
@@ -3313,7 +3321,8 @@ extern "C"
     cudaMalloc((void **)&gpu_dom.d_g, gpu_dom.nelt*nxyz*2*gpu_dom.ldim*sizeof(double));
     cudaMalloc((void **)&gpu_dom.d_dxm1, gpu_dom.nx1*gpu_dom.nx1*sizeof(double));
     cudaMalloc((void **)&gpu_dom.d_dxtm1, gpu_dom.nx1*gpu_dom.nx1*sizeof(double));
-
+    cudaMalloc((void **)&gpu_dom.d_mask, gpu_dom.mask_length*sizeof(double));
+    
     cudaMallocHost(&gpu_dom.reduced_value,sizeof(double));
 
     cudaCheckError();
@@ -3328,6 +3337,7 @@ extern "C"
     cudaMemcpy(gpu_dom.d_z, z, gpu_dom.nelt*nxyz*sizeof(double), cudaMemcpyHostToDevice);
     cudaMemcpy(gpu_dom.d_x, x, gpu_dom.nelt*nxyz*sizeof(double), cudaMemcpyHostToDevice);
     cudaMemcpy(gpu_dom.d_p, p, gpu_dom.nelt*nxyz*sizeof(double), cudaMemcpyHostToDevice);
+    cudaMemcpy(gpu_dom.d_mask, cmask+2, gpu_dom.mask_length*sizeof(double), cudaMemcpyHostToDevice);
 
 
     // Switch to AoS for d_g
@@ -3376,7 +3386,7 @@ extern "C"
     copy_cuda(gpu_dom.d_r, gpu_dom.d_f, n);
 
     // Zero out Dirichlet conditions
-    mask_cuda(gpu_dom.d_r, gpu_dom.nid);
+    mask_cuda(gpu_dom.d_r, gpu_dom.nid, gpu_dom.d_mask, gpu_dom.mask_length);
 
     double rnorm = sqrt(glsc3_cuda(gpu_dom.d_r, gpu_dom.d_c, gpu_dom.d_r, n));
       
@@ -3402,7 +3412,7 @@ extern "C"
 #endif
        add2s1_cuda(gpu_dom.d_p, gpu_dom.d_z, beta, n);
 
-       axcuda(gpu_dom.d_w, gpu_dom.d_p, gpu_dom.d_g, gpu_dom.d_dxm1, gpu_dom.d_dxtm1, gpu_dom.nx1, gpu_dom.ny1, gpu_dom.nz1, gpu_dom.nelt, gpu_dom.ldim, gpu_dom.nid);
+       axcuda(gpu_dom.d_w, gpu_dom.d_p, gpu_dom.d_g, gpu_dom.d_dxm1, gpu_dom.d_dxtm1, gpu_dom.nx1, gpu_dom.ny1, gpu_dom.nz1, gpu_dom.nelt, gpu_dom.ldim, gpu_dom.nid, gpu_dom.d_mask, gpu_dom.mask_length);
 
        pap = glsc3_cuda(gpu_dom.d_w, gpu_dom.d_c, gpu_dom.d_p, n);
 #ifdef DEBUG

@@ -39,8 +39,7 @@ c     set machine tolerances
 
       call rzero(x,n)
       call copy (r,f,n)
-c      call maskit (r,cmask,nx1,ny1,nz1) ! Zero out Dirichlet conditions
-      call masko (r) ! Zero out Dirichlet conditions
+      call maskit (r,cmask,nx1,ny1,nz1) ! Zero out Dirichlet conditions
 
       rnorm = sqrt(glsc3(r,c,r,n))
       iter = 0
@@ -99,8 +98,7 @@ c-----------------------------------------------------------------------
       real z(n),r(n)
 
       nn = n
-      call copy(z,r,n)
-c      call h1mg_solve(z,r,nn)
+      call h1mg_solve(z,r,nn)
 
       return
       end
@@ -129,8 +127,7 @@ c-----------------------------------------------------------------------
       call dssum(w)         ! Gather-scatter operation  ! w   = QQ  w
                                                            !            L
       call add2s2(w,u,.1,n)   !2n
-c      call maskit(w,cmask,nx1,ny1,nz1)  ! Zero out Dirichlet conditions
-      call masko(w)   ! Zero out Dirichlet conditions
+      call maskit(w,cmask,nx1,ny1,nz1)  ! Zero out Dirichlet conditions
 
       nxyz=nx1*ny1*nz1
       flop_a = flop_a + (19*nxyz+12*nx1*nxyz)*nelt

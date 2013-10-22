@@ -51,13 +51,15 @@ c     SET UP and RUN NEKBONE
            call proxy_setup(ah,bh,ch,dh,zh,wh,g) 
            call h1mg_setup
 
-           niter = 100
+           niter = 100*10
            n     = nx1*ny1*nz1*nelt
 
            call set_f(f,c,n)
 
            ! Initialized the GPU arrays
-           call cg_cuda_init(x,f,g,c,r,w,p,z,nx1,ny1,nz1,nelt,ldim,
+           call maskit(w, cmask, nx1, ny1, nz1) ! init the mask
+           call cg_cuda_init(x,f,g,c,r,w,p,z, cmask, 
+     &                       nx1,ny1,nz1,nelt,ldim,
      &                       dxm1,dxtm1,niter,flop_cg,gsh,nid)
 
            !Run cg iterations on device and copy back to host r vector
@@ -69,43 +71,43 @@ c     SET UP and RUN NEKBONE
            end do
 
            !Run cg iterations on host
+           time_beg = dnekclock()
+           call set_timer_flop_cnt(0)
            call cg(x,f,g,c,r,w,p,z,n,niter,flop_cg)
+           call set_timer_flop_cnt(1)
+           time_end = dnekclock()
 
            ! Compare the CPU and GPU solutions
-           do it=1,n
-             if (abs(r_gpu(it) - r(it)) .ge. 1e-14) then
-               write(6,*) "CPU and GPU results don't match, i=", 
-     +                    it, r_gpu(it), r(it)
-               exit
-             endif 
-           end do
+c           do it=1,n
+c             if (abs(r_gpu(it) - r(it)) .ge. 1e-14) then
+c               write(6,*) "CPU and GPU results don't match, i=", 
+c     +                    it, r_gpu(it), r(it)
+c               exit
+c             endif 
+c           end do
            write(6,*) "Max CPU GPU diff= ", maxval(r_gpu-r)
 
            ! Rerun with timing, without copying back to host
            call nekgsync()
 
-           call set_timer_flop_cnt(0)
 c          call summary_start()
 
            write(6,*) '---------------------------------------------'
            write(6,*) 'GPU RESULTS'
            write(6,*) '---------------------------------------------'
-           !Run cg iterations on device
-           call cg_cuda(r,0)
 
+           !Run cg iterations on device
+           call set_timer_flop_cnt(0)
+           call cg_cuda(r,0)
+           call set_timer_flop_cnt(1)
+
+           if(nid.eq.0) then
            write(6,*) '---------------------------------------------'
            write(6,*) 'CPU RESULTS'
            write(6,*) '---------------------------------------------'
-
-           ! Run same computation on host
-           call set_timer_flop_cnt(0)
-           time_beg = dnekclock()
-           call cg(x,f,g,c,r,w,p,z,n,niter,flop_cg)
-           time_end = dnekclock()
-           write(6,*) "CPU time: ",time_beg-time_end
+           write(6,*) "CPU time: ",time_end - time_beg
            write(6,*) "---------------------------------------------"
-
-           call set_timer_flop_cnt(1)
+           endif
 
 c          call summary_stop()
            call gs_free(gsh)
@@ -116,17 +118,6 @@ c          call summary_stop()
          enddo
       enddo
 
-      avmflop = 0.0
-      do i = 1,icount
-         avmflop = avmflop+mfloplist(i)
-      enddo
-      if(icount.ne.0) then
-         avmflop=avmflop/icount
-      endif
-      if(nid.eq.0) then
-         write(6,1) avmflop
-      endif
-  1   format('Avg MFlops = ',1pe12.4)
   5   format('| ' A7,' | ' A7,' | ' A12,
      &       ' | ', A12, ' | ', A12, ' | ')
 
