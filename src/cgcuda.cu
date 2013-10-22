@@ -7,12 +7,37 @@
 #include "sm_utils.inl"
 #include "thrust/device_ptr.h"
 #include "thrust/reduce.h"
+#include "mpi.h"
 
 #include "cgcuda.h"
 
 cublasHandle_t cublas_handle;
 
 //#define AOS
+
+struct comm_data {
+  uint n;      /* number of messages */
+  uint *p;     /* message source/dest proc */
+  uint *size;  /* size of message */
+  uint total;  /* sum of message sizes */
+};
+
+struct mpi_comm_wrapper 
+{
+ MPI_Comm mpi_comm;
+ uint id;
+ uint np;
+};
+
+struct gpu_map 
+{
+  uint size_from;
+  uint size_to;
+  uint* d_offsets;
+  uint* d_indices_from;
+  uint* d_indices_from_COO;
+  uint* d_indices_to;
+};
 
 struct gpu_domain
 {
@@ -40,22 +65,43 @@ struct gpu_domain
   int nid;
   int niter;
 
-  uint size_from[2];
-  uint size_to[2];
-  uint* d_map_offsets[2];
-  uint* d_map_indices_from[2];
-  uint* d_map_indices_from_COO[2];
-  uint* d_map_indices_to[2];
+  struct gpu_map local_map[2];
   uint* d_flagged_primaries;
+  int flagged_primaries_size;
 
+  // MPI communication 
+  struct comm_data comm_struct[2];
+  struct gpu_map comm_map[2];
+
+  // Mpi buffer
+  uint buffer_size;
+  double* h_buffer;
+  double* d_buffer;
+
+  // Mpi requests
+  MPI_Request* req; 
+  mpi_comm_wrapper comm;
 };
- /* GPU data pointers */
 
 static gpu_domain gpu_dom;
 
-void fill_gpu_maps(uint* size_from, uint* size_to, uint** d_map_offsets, uint** d_map_indices_from, uint** d_map_indices_from_COO, uint** d_map_indices_to, const uint* map)
+void init_comm_struct(comm_data* comm_struct, uint n, const uint* p, const uint* size, uint total)
 {
+  comm_struct->p = (uint*) malloc(2*n*sizeof(uint));
+  comm_struct->size = comm_struct->p + n;
 
+  for (int i=0;i<n;i++)
+  {
+    (comm_struct->p)[i] = p[i];
+    (comm_struct->size)[i] = size[i];
+  }
+
+  comm_struct->n = n;
+  comm_struct->total = total;
+}
+
+void fill_gpu_maps(gpu_map* cuda_map, const uint* map)
+{
   cudaCheckError();
   const uint* orig = map;
 
@@ -102,47 +148,57 @@ void fill_gpu_maps(uint* size_from, uint* size_to, uint** d_map_offsets, uint** 
     h_map_offsets[count_from] = count_to; 
   } 
 
+//   printf("size_from=%d\n",size_from_tmp);
+//   printf("size_to=%d\n",size_to_tmp);
+//   for (int i = 0; i < size_from_tmp; i++) {
+//     printf("%d: ", h_map_indices_from[i]);
+//     for (int j = h_map_offsets[i]; j < h_map_offsets[i+1]; j++)
+//       printf("%d ", h_map_indices_to[j]);
+//     printf("\n");
+//   }
+//   printf("\n");
+//   for (int i = 0; i < size_to_tmp; i++)
+//     printf("%d ", h_map_indices_to[i]);
+//   printf("\n");
+
   cudaCheckError();
-#ifdef DEBUG
-  printf("size_from=%d\n",size_from_tmp);
-  printf("size_to=%d\n",size_to_tmp);
-#endif
-  cudaMalloc((void **) d_map_offsets, (size_from_tmp+1)*sizeof(uint));
-  cudaMalloc((void **) d_map_indices_from, size_from_tmp*sizeof(uint));
-  cudaMalloc((void **) d_map_indices_to, size_to_tmp*sizeof(uint));
-  cudaMalloc((void **) d_map_indices_from_COO, size_to_tmp*sizeof(uint));
+  cudaMalloc((void **) &(cuda_map->d_offsets), (size_from_tmp+1)*sizeof(uint));
+  cudaMalloc((void **) &(cuda_map->d_indices_from), size_from_tmp*sizeof(uint));
+  cudaMalloc((void **) &(cuda_map->d_indices_to), size_to_tmp*sizeof(uint));
+  cudaMalloc((void **) &(cuda_map->d_indices_from_COO), size_to_tmp*sizeof(uint));
 
-  cudaMemcpy(*d_map_offsets, h_map_offsets, (size_from_tmp+1)*sizeof(uint), cudaMemcpyHostToDevice);
-  cudaMemcpy(*d_map_indices_from, h_map_indices_from, size_from_tmp*sizeof(uint), cudaMemcpyHostToDevice);
-  cudaMemcpy(*d_map_indices_to, h_map_indices_to, size_to_tmp*sizeof(uint), cudaMemcpyHostToDevice);
-  cudaMemcpy(*d_map_indices_from_COO, h_map_indices_from_COO, size_to_tmp*sizeof(uint), cudaMemcpyHostToDevice);
+  cudaMemcpy(cuda_map->d_offsets, h_map_offsets, (size_from_tmp+1)*sizeof(uint), cudaMemcpyHostToDevice);
+  cudaMemcpy(cuda_map->d_indices_from, h_map_indices_from, size_from_tmp*sizeof(uint), cudaMemcpyHostToDevice);
+  cudaMemcpy(cuda_map->d_indices_to, h_map_indices_to, size_to_tmp*sizeof(uint), cudaMemcpyHostToDevice);
+  cudaMemcpy(cuda_map->d_indices_from_COO, h_map_indices_from_COO, size_to_tmp*sizeof(uint), cudaMemcpyHostToDevice);
 
-
-  *size_from = size_from_tmp;
-  *size_to = size_to_tmp;
+  cuda_map->size_from = size_from_tmp;
+  cuda_map->size_to = size_to_tmp;
   cudaCheckError();
-
-  //printf("map_offsets\n");
-  //for (int i=0;i<(size_from+1);i++)
-  //  printf("%d\n",h_map_offsets[i]);
-  //printf("map_indices_from\n");
-  //for (int i=0;i<(size_from);i++)
-  //  printf("%d\n",h_map_indices_from[i]);
-
-  //printf("map_indices_to\n");
-  //for (int i=0;i<(size_to);i++)
-  //  printf("%d\n",h_map_indices_to[i]);
-
 }
 
-void fill_flagged_primaries_map(uint* d_flagged_primaries, const uint* flagged_primaries)
+void fill_flagged_primaries_map(uint** d_flagged_primaries, const uint* flagged_primaries)
 {
-
+//  cudaMalloc((void **) d_flagged_primaries, (size_from_tmp+1)*sizeof(uint));
 }
 
 template <typename T>
 __global__
-void local_gather_kernel(T* __restrict__ out, const T* __restrict__ in, const uint* __restrict__ offsets, const uint* __restrict__ map_indices_from, const uint* __restrict__ map_indices_to, int size  )
+void local_init_kernel(T* __restrict__ out,  const uint* __restrict__ flagged_primaries, int size  )
+{
+  for (int tid = blockDim.x*blockIdx.x + threadIdx.x; tid < size; tid+= gridDim.x * blockDim.x) 
+  {
+    out[flagged_primaries[tid]] = 0.;
+  }
+}
+
+
+template <typename T>
+__global__
+void local_gather_kernel(T* __restrict__ out, const T* __restrict__ in, 
+                         const uint* __restrict__ offsets, 
+                         const uint* __restrict__ map_indices_from, 
+                         const uint* __restrict__ map_indices_to, int size  )
 {
   for (int tid = blockDim.x*blockIdx.x + threadIdx.x; tid < size; tid+= gridDim.x * blockDim.x) 
   {
@@ -158,12 +214,14 @@ void local_gather_kernel(T* __restrict__ out, const T* __restrict__ in, const ui
 
 template <typename T>
 __global__
-void local_scatter_kernel(T* __restrict__ out, const T* __restrict__ in, const uint* __restrict__ offsets, const uint* __restrict__ map_indices_from, const uint* __restrict__ map_indices_to, int size  )
+void local_scatter_kernel(T* __restrict__ out, const T* __restrict__ in, 
+                          const uint* __restrict__ offsets, 
+                          const uint* __restrict__ map_indices_from, 
+                          const uint* __restrict__ map_indices_to, int size  )
 {
   for (int tid = blockDim.x*blockIdx.x + threadIdx.x; tid < size; tid+= gridDim.x * blockDim.x) 
   {
     T t = in[map_indices_from[tid]]; 
-
     for (int i=offsets[tid];i<offsets[tid+1];i++)
     {
       out[map_indices_to[i]] = t;  
@@ -183,30 +241,55 @@ void local_scatter_kernel_COO(T* __restrict__ out, const T* __restrict__ in,  co
   }
 }
 
-void local_gather_cuda(double* out, const double* in, 
-                       const uint *map_offsets, const uint* map_indices_from, const uint* map_indices_from_COO, const uint* map_indices_to, int size_from, int size_to)
+void local_init_cuda(double* out, uint* flagged_primaries, int flagged_primaries_size)
+//                       const uint *map_offsets, const uint* map_indices_from, const uint* map_indices_from_COO, const uint* map_indices_to, int size_from, int size_to)
 {
 
   const int cta_size= 128;
-  const int grid_size = min(4096,(size_from+cta_size-1)/cta_size);
+  const int grid_size = min(4096,(flagged_primaries_size+cta_size-1)/cta_size);
   cudaCheckError();
-  local_gather_kernel<<<grid_size,cta_size>>>(out,in,map_offsets,map_indices_from,map_indices_to,size_from);
+  local_init_kernel<<<grid_size,cta_size>>>(out,flagged_primaries,flagged_primaries_size);
   cudaCheckError();
 }
 
-void local_scatter_cuda(double* out, const double* in,
-                       const uint *map_offsets, const uint* map_indices_from, const uint* map_indices_from_COO, const uint* map_indices_to, int size_from, int size_to)
+
+
+
+void local_gather_cuda(double* out, const double* in,  gpu_map* map)
+//                       const uint *map_offsets, const uint* map_indices_from, const uint* map_indices_from_COO, const uint* map_indices_to, int size_from, int size_to)
 {
 
-  //const int cta_size= 128;
-  //const int grid_size = min(4096,(size_from+cta_size-1)/cta_size);
-  //local_scatter_kernel<<<grid_size,cta_size>>>(out,in,map_offsets,map_indices_from,map_indices_to,size_from );
-  //cudaCheckError();
+  cudaCheckError();
 
   const int cta_size= 128;
-  const int grid_size = min(4096,(size_to+cta_size-1)/cta_size);
-  local_scatter_kernel_COO<<<grid_size,cta_size>>>(out,in,map_indices_from_COO,map_indices_to,size_to);
+  const int grid_size = min(4096,(map->size_from+cta_size-1)/cta_size);
   cudaCheckError();
+  local_gather_kernel<<<grid_size,cta_size>>>(out,in,map->d_offsets,
+                                              map->d_indices_from,map->d_indices_to,map->size_from);
+  cudaCheckError();
+}
+
+
+
+//void local_scatter_cuda(double* out, const double* in,
+//                       const uint *map_offsets, const uint* map_indices_from, const uint* map_indices_from_COO, const uint* map_indices_to, int size_from, int size_to)
+//
+void local_scatter_cuda(double* out, double* in, gpu_map* map)
+//  pdouble* out, const double* in,
+//                       const uint *map_offsets, const uint* map_indices_from, const uint* map_indices_from_COO, const uint* map_indices_to, int size_from, int size_to)
+{
+
+  const int cta_size= 128;
+  const int grid_size = min(4096,(map->size_from+cta_size-1)/cta_size);
+  //const int grid_size = min(1,(map->size_from+cta_size-1)/cta_size);
+  local_scatter_kernel<<<grid_size,cta_size>>>(out,in,map->d_offsets,
+                                               map->d_indices_from,map->d_indices_to,map->size_from );
+  cudaCheckError();
+
+  //const int cta_size= 128;
+  //const int grid_size = min(4096,(map->size_to+cta_size-1)/cta_size);
+  //local_scatter_kernel_COO<<<grid_size,cta_size>>>(out,in,map->d_indices_from_COO,map->d_indices_to,map->size_to);
+  //cudaCheckError();
 
 }
 
@@ -306,247 +389,6 @@ template<typename T>
 
     return;
   }
-
-#if 1
-template<int p, int p_sq, int p_cube, int p_cube_padded, int pts_per_thread, int slab_size, int cta_size>
-__global__
-__launch_bounds__(288,1)
-void ax_cuda_kernel_v5(const double* __restrict__ u_glob, double* __restrict__ w, const double* __restrict__ g, const double* __restrict__ dxm1, const double* __restrict__ dxtm1, int n_cells)
-{
-  int tid = threadIdx.x;
-  __shared__ double s_temp[cta_size];
-
-  for (int cell_id=blockIdx.x; cell_id < n_cells; cell_id += gridDim.x)
-  {
-    double u[pts_per_thread];
-
-    // Load u in shared for the entire cell
-    int offset = cell_id*p_cube;
-    #pragma unroll
-    for (int k=0;k<pts_per_thread;k++)
-    {
-      int pt_id = k*cta_size + tid;
-      __syncthreads();
-      s_temp[tid] = ld_functions::ld_cg(&u_glob[offset + pt_id]);
-      __syncthreads();
-
-      // Transpose to store in registers and allow shfl
-      int pos = (tid%slab_size)*p_sq + tid/slab_size;
-      u[k] = s_temp[pos];
-    }
-
-    double wa[pts_per_thread];
-    // Initialize wa to 0.
-    #pragma unroll
-    for (int k=0;k<pts_per_thread;k++)
-    {
-      wa[k] = 0.;
-    }
-
-    // Now compute w for one slab at a time
-    #pragma unroll
-    for (int k=0;k<pts_per_thread;k++)
-    {
-      int pt_id = k*cta_size + tid;
-      int pt_id_div_p = pt_id/p;
-      int pt_id_mod_p = pt_id%p;
-      int pt_id_div_p_sq = pt_id/p_sq;
-      int pt_id_mod_p_sq = pt_id%p_sq;
-
-      int tid_mod_p = tid%p;
-      int tid_div_p = tid/p;
-      int tid_mod_p_sq = tid%p_sq;
-      int tid_div_p_sq = tid/p_sq;
-
-      double ur, us, ut;
-
-      // Load slab in shared
-      int pos = (tid%slab_size)*p_sq + tid/slab_size;
-      __syncthreads();
-      s_temp[pos] = u[k];
-      __syncthreads();
-
-      //  Now that data is loaded in shared, compute ur
-      {
-        //int s_offset = pt_id_div_p*p;
-        //int d_offset  = pt_id_mod_p;
-
-        int d_offset  = tid_mod_p;
-        int s_offset = tid_div_p*p;
-
-        ur = 0.;
-        #pragma unroll
-        for (int i=0;i<p;i++)
-          ur += __ldg(&dxm1[d_offset + p*i])*s_temp[s_offset + i];
-      }
-
-      // Compute us
-      {
-        //int plane = pt_id_div_p_sq;
-        //int s_offset = plane*p_sq + pt_id_mod_p;
-        //int d_offset = p*( (pt_id-plane*p_sq)/p);
-
-
-        int plane = tid_div_p_sq;
-        int s_offset = plane*p_sq + tid_mod_p;
-        int d_offset = p*( (tid-plane*p_sq)/p);
-        int stride = p;
-
-        us = 0.;
-        #pragma unroll
-        for (int i=0;i<p;i++)
-          us += s_temp[s_offset + p*i]*__ldg(&dxtm1[d_offset + i]);
-      }
-      if (cell_id == 0 && tid == 166)
-        printf("k=%d, us = %f\n",k,us);
-
-      // Use shuffle to compute ut
-#if 1
-      // Compute ut
-      {
-        //int d_offset = pt_id_div_p_sq*p;
-
-        int d_offset = (k*cta_size + pos)/p_sq*p;
-        ut = 0.;
-        #pragma unroll
-        for (int j=0;j<pts_per_thread;j++)
-        {
-          #pragma unroll
-          for (int m=0;m<slab_size;m++)
-          {
-            int i = j*slab_size+m;
-            double val = u[j];
-            double sh_val = utils::shfl(val,m,slab_size);
-            if (cell_id == 0 && tid == 166)
-              printf("k=%d, u = %f, dxtm1 = %f\n",k,sh_val,__ldg(&dxtm1[d_offset + i]));
-            ut += sh_val*__ldg(&dxtm1[d_offset + i]);
-          }
-        }
-
-        __syncthreads();
-        s_temp[tid] = ut;
-        __syncthreads();
-        ut = s_temp[pos];
-        __syncthreads();
-
-        if (cell_id == 0 && tid == 166)
-          printf("k=%d, ut = %f\n",k,ut);
-          //ut += s_u[s_offset + p_sq*i]*__ldg(&dxtm1[d_offset + i]);
-
-      }
-#endif
-
-      // Transform
-      {
-        int offset = (cell_id*p_cube + pt_id)*6;
-
-        //TODO: Switch to SOA
-        double metric[6];
-        #pragma unroll
-        for (int i=0;i<6;i++)
-          metric[i] = g[offset+i];
-          //metric[i] = ld_functions::ld_cg(&g[offset+i]);
-          //metric[i] = g[offset+i];
-
-
-        // SOA HACK
-        /*
-        int offset = cell_id*p_cube + pt_id;
-
-        //TODO: Switch to SOA
-        double metric[6];
-        #pragma unroll
-        for (int i=0;i<6;i++)
-        {
-          //metric[i] = g[offset];
-          metric[i] = ld_functions::ld_cg(&g[offset]);
-          offset += n_cells*p_cube;
-        }
-        */
-
-
-
-          //metric[i] = ld_functions::ld_cg(&(g[offset+i]));
-
-        double wr = metric[0]*ur + metric[1]*us + metric[2]*ut;
-        double ws = metric[1]*ur + metric[3]*us + metric[4]*ut;
-        double wt = metric[2]*ur + metric[4]*us + metric[5]*ut;
-
-        ur = wr;
-        us = ws;
-        ut = wt;
-      }
-
-      __syncthreads();
-      // Store ur in shared memory
-      s_temp[tid] = ur;
-      __syncthreads();
-
-      // Now that data is loaded in shared, compute wa
-      {
-        int d_offset  = tid_mod_p;
-        int s_offset = tid_div_p*p;
-
-        #pragma unroll
-        for (int i=0;i<p;i++)
-          wa[k] += __ldg(&dxtm1[d_offset+p*i])*s_temp[s_offset + i];
-      }
-
-      __syncthreads();
-      s_temp[tid] = us;
-      __syncthreads();
-
-      // Compute us
-      {
-
-        int plane = tid_div_p_sq;
-        int s_offset = plane*p_sq + tid_mod_p;
-        int d_offset = p*( (tid-plane*p_sq)/p);
-
-        #pragma unroll
-        for (int i=0;i<p;i++)
-          wa[k] += s_temp[s_offset + p*i]*__ldg(&dxm1[d_offset + i]);
-      }
-
-
-      // Use shuffle to compute contribution from ut
-      __syncthreads();
-      // Store ut in shared memory
-      s_temp[tid] = ut;
-      __syncthreads();
-
-      #pragma unroll
-      for (int k2=0;k2<pts_per_thread;k2++)
-      {
-        int i_start = k*slab_size;
-        int pt_id_2 = k2*cta_size + tid;
-        int plane = pt_id_2/p_sq;
-
-        int s_offset = tid_mod_p_sq;
-        int d_offset = plane*p;
-
-        #pragma unroll
-        for (int i_count=0; i_count < slab_size; i_count++)
-        {
-          wa[k2] += s_temp[s_offset + p_sq*i_count]*__ldg(&dxm1[d_offset + i_start]);
-          i_start++;
-        }
-      }
-      __syncthreads();
-
-    } // Loop over k
-
-    #pragma unroll
-    for (int k=0;k<pts_per_thread;k++)
-    {
-      int pt_id = k*cta_size + tid;
-      w[offset + pt_id] = wa[k];
-    }
-  } // Loop over blocks
-
-}
-#endif
-
 
 template<int p, int p_sq, int p_cube, int p_cube_padded, int pts_per_thread, int slab_size, int cta_size, int num_ctas>
 __global__
@@ -795,2114 +637,12 @@ void ax_cuda_kernel_v8_shared_D(const double* __restrict__ u_global, double* __r
 
 }
 
-
-
-
-template<int p, int p_sq, int p_cube, int p_cube_padded, int pts_per_thread, int slab_size, int cta_size, int num_ctas>
-__global__
-__launch_bounds__(cta_size,num_ctas)
-void ax_cuda_kernel_v8(const double* __restrict__ u_global, double* __restrict__ w, const double* __restrict__ g, const double* __restrict__ dxm1, const double* __restrict__ dxtm1, int n_cells)
-{
-  int tid = threadIdx.x;
-  __shared__ double temp[cta_size];
-
-  for (int cell_id=blockIdx.x; cell_id < n_cells; cell_id += gridDim.x)
-  {
-    // Load u in shared for the entire cell
-    int offset = cell_id*p_cube;
-
-    int tid_mod_p = tid%p;
-    int tid_div_p = tid/p;
-    int tid_mod_p_sq = tid%p_sq;
-    int tid_div_p_sq = tid/p_sq;
-
-    double u[pts_per_thread];
-    #pragma unroll
-    for (int k=0;k<pts_per_thread;k++)
-    {
-      int pt_id = k*cta_size + tid;
-
-      u[k] = ld_functions::ld_cg(&u_global[offset + pt_id]);
-    }
-
-    // Initialize wa to 0.
-    double wa[pts_per_thread];
-    #pragma unroll
-    for (int k=0;k<pts_per_thread;k++)
-      wa[k] = 0.;
-
-    // Now compute w for one slab at a time
-    #pragma unroll
-    for (int k=0;k<pts_per_thread;k++)
-    {
-      int pt_id = k*cta_size + tid;
-      int pt_id_div_p = pt_id/p;
-      int pt_id_mod_p = pt_id%p;
-      int pt_id_div_p_sq = pt_id/p_sq;
-      int pt_id_mod_p_sq = pt_id%p_sq;
-
-      double ur, us, ut;
-
-      // Load first slab in shared memory
-      __syncthreads();
-      temp[tid] = u[k];
-      __syncthreads();
-      
-
-      //  Now that data is loaded in shared, compute ur
-      {
-        int s_offset = tid_div_p*p;
-        int d_offset  = tid_mod_p;
-
-        ur = 0.;
-        #pragma unroll
-        for (int i=0;i<p;i++)
-          ur += __ldg(&dxm1[d_offset + p*i])*temp[s_offset + i];
-      }
-
-      // Compute us
-      {
-        int plane = tid_div_p_sq;
-        int s_offset = plane*p_sq + tid_mod_p;
-        int d_offset = p*( (tid-plane*p_sq)/p);
-
-        us = 0.;
-        #pragma unroll
-        for (int i=0;i<p;i++)
-          us += temp[s_offset + p*i]*__ldg(&dxtm1[d_offset + i]);
-      }
-
-
-      // Load all slabs in shared, one by one to compute ut
-      ut = 0.;
-      #pragma unroll
-      for (int k2=0;k2<pts_per_thread;k2++)
-      {
-        int i_start = k2*slab_size;
-
-        // Load in shared
-        __syncthreads();
-        temp[tid] = u[k2];
-        __syncthreads();
-
-        // Compute ut
-        int s_offset = tid_mod_p_sq;
-        int d_offset = pt_id_div_p_sq*p;
-
-        #pragma unroll
-        for (int icount=0;icount<slab_size;icount++)
-        {
-          ut += temp[s_offset + p_sq*icount]*__ldg(&dxtm1[d_offset + i_start]);
-          i_start++;
-        }
-      }
-
-      // Transform
-      {
-        int offset = (cell_id*p_cube + pt_id)*6;
-
-        //TODO: Switch to SOA
-        double metric[6];
-        #pragma unroll
-        for (int i=0;i<6;i++)
-          metric[i] = g[offset+i];
-          //metric[i] = ld_functions::ld_cg(&g[offset+i]);
-          //metric[i] = g[offset+i];
-
-
-        // SOA HACK
-        /*
-        int offset = cell_id*p_cube + pt_id;
-
-        //TODO: Switch to SOA
-        double metric[6];
-        #pragma unroll
-        for (int i=0;i<6;i++)
-        {
-          //metric[i] = g[offset];
-          metric[i] = ld_functions::ld_cg(&g[offset]);
-          offset += n_cells*p_cube;
-        }
-        */
-
-
-
-          //metric[i] = ld_functions::ld_cg(&(g[offset+i]));
-
-        double wr = metric[0]*ur + metric[1]*us + metric[2]*ut;
-        double ws = metric[1]*ur + metric[3]*us + metric[4]*ut;
-        double wt = metric[2]*ur + metric[4]*us + metric[5]*ut;
-
-        ur = wr;
-        us = ws;
-        ut = wt;
-      }
-
-      // Store ur in shared memory
-      __syncthreads();
-      temp[tid] = ur;
-      __syncthreads();
-
-      // Now that data is loaded in shared, compute wa
-
-      {
-        int d_offset  = tid_mod_p;
-        int s_offset = tid_div_p*p;
-
-        #pragma unroll
-        for (int i=0;i<p;i++)
-          wa[k] += __ldg(&dxtm1[d_offset+p*i])*temp[s_offset + i];
-      }
-
-      __syncthreads();
-      temp[tid] = us;
-      __syncthreads();
-
-      // Compute us
-      {
-
-        int plane = tid_div_p_sq;
-        int s_offset = plane*p_sq + tid_mod_p;
-        int d_offset = p*( (tid-plane*p_sq)/p);
-
-        #pragma unroll
-        for (int i=0;i<p;i++)
-          wa[k] += temp[s_offset + p*i]*__ldg(&dxm1[d_offset + i]);
-      }
-
-      __syncthreads();
-      // Store ut in shared memory
-      temp[tid] = ut;
-      __syncthreads();
-
-      #pragma unroll
-      for (int k2=0;k2<pts_per_thread;k2++)
-      {
-        int i_start = k*slab_size;
-        int pt_id_2 = k2*cta_size + tid;
-        int plane = pt_id_2/p_sq;
-
-        int s_offset = tid_mod_p_sq;
-        int d_offset = plane*p;
-
-        #pragma unroll
-        for (int i_count=0; i_count < slab_size; i_count++)
-        {
-          wa[k2] += temp[s_offset + p_sq*i_count]*__ldg(&dxm1[d_offset + i_start]);
-          i_start++;
-        }
-      }
-      __syncthreads();
-
-    } // Loop over k
-
-    #pragma unroll
-    for (int k=0;k<pts_per_thread;k++)
-    {
-      int pt_id = k*cta_size + tid;
-      w[offset + pt_id] = wa[k];
-    }
-  } // Loop over blocks
-
-}
-
-
-
-
-template<int p, int p_sq, int p_cube, int p_cube_padded, int pts_per_thread, int slab_size, int cta_size>
-__global__
-__launch_bounds__(432,2)
-//__launch_bounds__(288,3)
-void ax_cuda_kernel_v7(const double* __restrict__ u_global, double* __restrict__ w, const double* __restrict__ g, const double* __restrict__ dxm1, const double* __restrict__ dxtm1, int n_cells)
-{
-  int tid = threadIdx.x;
-  __shared__ double temp[cta_size];
-
-  for (int cell_id=blockIdx.x; cell_id < n_cells; cell_id += gridDim.x)
-  {
-    // Load u in shared for the entire cell
-    int offset = cell_id*p_cube;
-
-    int tid_mod_p = tid%p;
-    int tid_div_p = tid/p;
-    int tid_mod_p_sq = tid%p_sq;
-    int tid_div_p_sq = tid/p_sq;
-
-    double u[p];
-    #pragma unroll
-    for (int k=0;k<pts_per_thread;k++)
-    {
-      int pt_id = k*cta_size + tid;
-
-      __syncthreads();
-      temp[tid] = ld_functions::ld_cg(&u_global[offset + pt_id]);
-      __syncthreads();
-
-      // Each thread stores the values of u along z
-      #pragma unroll
-      for (int j=0;j<slab_size;j++)
-      {
-        u[k*slab_size+j] = temp[j*p_sq + tid_mod_p_sq];
-      }
-      //s_u[pt_id] = u[offset + pt_id];
-    }
-
-    __syncthreads();
-
-    // Initialize wa to 0.
-    double wa[pts_per_thread];
-    #pragma unroll
-    for (int k=0;k<pts_per_thread;k++)
-    {
-      wa[k] = 0.;
-    }
-
-    // Now compute w for one slab at a time
-    for (int k=0;k<pts_per_thread;k++)
-    {
-      int pt_id = k*cta_size + tid;
-      int pt_id_div_p = pt_id/p;
-      int pt_id_mod_p = pt_id%p;
-      int pt_id_div_p_sq = pt_id/p_sq;
-      int pt_id_mod_p_sq = pt_id%p_sq;
-
-
-      double ur, us, ut;
-
-      // Load first slab in shared memory
-      __syncthreads();
-      temp[tid] = u[pt_id_div_p_sq];
-      __syncthreads();
-      
-
-      //  Now that data is loaded in shared, compute ur
-      {
-        int s_offset = tid_div_p*p;
-        int d_offset  = tid_mod_p;
-
-        ur = 0.;
-        #pragma unroll
-        for (int i=0;i<p;i++)
-          ur += __ldg(&dxm1[d_offset + p*i])*temp[s_offset + i];
-      }
-
-      // Compute us
-      {
-        int plane = tid_div_p_sq;
-        int s_offset = plane*p_sq + tid_mod_p;
-        int d_offset = p*( (tid-plane*p_sq)/p);
-
-        us = 0.;
-        #pragma unroll
-        for (int i=0;i<p;i++)
-          us += temp[s_offset + p*i]*__ldg(&dxtm1[d_offset + i]);
-      }
-
-      // Compute ut
-      {
-        int d_offset = pt_id_div_p_sq*p;
-
-        ut = 0.;
-        #pragma unroll
-        for (int i=0;i<p;i++)
-        {
-          ut += u[i]*__ldg(&dxtm1[d_offset + i]);
-        }
-      }
-
-      // Transform
-      {
-
-        int offset = (cell_id*p_cube + pt_id)*6;
-
-        //TODO: Switch to SOA
-        double metric[6];
-        #pragma unroll
-        for (int i=0;i<6;i++)
-          metric[i] = g[offset+i];
-          //metric[i] = ld_functions::ld_cg(&g[offset+i]);
-          //metric[i] = g[offset+i];
-
-
-        // SOA HACK
-        /*
-        int offset = cell_id*p_cube + pt_id;
-
-        //TODO: Switch to SOA
-        double metric[6];
-        #pragma unroll
-        for (int i=0;i<6;i++)
-        {
-          //metric[i] = g[offset];
-          metric[i] = ld_functions::ld_cg(&g[offset]);
-          offset += n_cells*p_cube;
-        }
-        */
-
-
-
-          //metric[i] = ld_functions::ld_cg(&(g[offset+i]));
-
-        double wr = metric[0]*ur + metric[1]*us + metric[2]*ut;
-        double ws = metric[1]*ur + metric[3]*us + metric[4]*ut;
-        double wt = metric[2]*ur + metric[4]*us + metric[5]*ut;
-
-        ur = wr;
-        us = ws;
-        ut = wt;
-      }
-
-      // Store ur in shared memory
-      temp[tid] = ur;
-      __syncthreads();
-
-      // Now that data is loaded in shared, compute wa
-
-      {
-        int d_offset  = tid_mod_p;
-        int s_offset = tid_div_p*p;
-
-        #pragma unroll
-        for (int i=0;i<p;i++)
-          wa[k] += __ldg(&dxtm1[d_offset+p*i])*temp[s_offset + i];
-      }
-
-      __syncthreads();
-      temp[tid] = us;
-      __syncthreads();
-
-      // Compute us
-      {
-
-        int plane = tid_div_p_sq;
-        int s_offset = plane*p_sq + tid_mod_p;
-        int d_offset = p*( (tid-plane*p_sq)/p);
-
-        #pragma unroll
-        for (int i=0;i<p;i++)
-          wa[k] += temp[s_offset + p*i]*__ldg(&dxm1[d_offset + i]);
-      }
-
-      __syncthreads();
-      // Store ut in shared memory
-      temp[tid] = ut;
-      __syncthreads();
-
-      #pragma unroll
-      for (int k2=0;k2<pts_per_thread;k2++)
-      {
-        int i_start = k*slab_size;
-        int pt_id_2 = k2*cta_size + tid;
-        int plane = pt_id_2/p_sq;
-
-        int s_offset = tid_mod_p_sq;
-        int d_offset = plane*p;
-
-        #pragma unroll
-        for (int i_count=0; i_count < slab_size; i_count++)
-        {
-          wa[k2] += temp[s_offset + p_sq*i_count]*__ldg(&dxm1[d_offset + i_start]);
-          i_start++;
-        }
-      }
-      __syncthreads();
-
-    } // Loop over k
-
-    #pragma unroll
-    for (int k=0;k<pts_per_thread;k++)
-    {
-      int pt_id = k*cta_size + tid;
-      w[offset + pt_id] = wa[k];
-    }
-  } // Loop over blocks
-
-}
-
-
-
-template<int p, int p_sq, int p_cube, int p_cube_padded, int pts_per_thread, int slab_size, int cta_size>
-__global__
-__launch_bounds__(432,2)
-//__launch_bounds__(288,3)
-void ax_cuda_kernel_v4(const double* __restrict__ u, double* __restrict__ w, const double* __restrict__ g, const double* __restrict__ dxm1, const double* __restrict__ dxtm1, int n_cells)
-{
-  int tid = threadIdx.x;
-  __shared__ double s_u[p_cube];
-  __shared__ double temp[cta_size];
-
-  for (int cell_id=blockIdx.x; cell_id < n_cells; cell_id += gridDim.x)
-  {
-    // Load u in shared for the entire cell
-    int offset = cell_id*p_cube;
-    #pragma unroll
-    for (int k=0;k<pts_per_thread;k++)
-    {
-      int pt_id = k*cta_size + tid;
-      s_u[pt_id] = ld_functions::ld_cg(&u[offset + pt_id]);
-      //s_u[pt_id] = u[offset + pt_id];
-    }
-
-    __syncthreads();
-
-    // Initialize wa to 0.
-    double wa[pts_per_thread];
-    #pragma unroll
-    for (int k=0;k<pts_per_thread;k++)
-    {
-      wa[k] = 0.;
-    }
-
-    // Now compute w for one slab at a time
-    #pragma unroll
-    for (int k=0;k<pts_per_thread;k++)
-    {
-      int pt_id = k*cta_size + tid;
-      int pt_id_div_p = pt_id/p;
-      int pt_id_mod_p = pt_id%p;
-      int pt_id_div_p_sq = pt_id/p_sq;
-      int pt_id_mod_p_sq = pt_id%p_sq;
-
-      int tid_mod_p = tid%p;
-      int tid_div_p = tid/p;
-      int tid_mod_p_sq = tid%p_sq;
-      int tid_div_p_sq = tid/p_sq;
-
-      double ur, us, ut;
-
-      //  Now that data is loaded in shared, compute ur
-      {
-        int s_offset = pt_id_div_p*p;
-        int d_offset  = pt_id_mod_p;
-
-        ur = 0.;
-        #pragma unroll
-        for (int i=0;i<p;i++)
-          ur += __ldg(&dxm1[d_offset + p*i])*s_u[s_offset + i];
-      }
-
-      // Compute us
-      {
-        int plane = pt_id_div_p_sq;
-        int s_offset = plane*p_sq + pt_id_mod_p;
-        int d_offset = p*( (pt_id-plane*p_sq)/p);
-
-        us = 0.;
-        #pragma unroll
-        for (int i=0;i<p;i++)
-          us += s_u[s_offset + p*i]*__ldg(&dxtm1[d_offset + i]);
-      }
-
-      // Compute ut
-      {
-        int s_offset = pt_id_mod_p_sq;
-        int d_offset = pt_id_div_p_sq*p;
-
-        ut = 0.;
-        #pragma unroll
-        for (int i=0;i<p;i++)
-        {
-          ut += s_u[s_offset + p_sq*i]*__ldg(&dxtm1[d_offset + i]);
-        }
-      }
-
-      // Transform
-      {
-
-        int offset = (cell_id*p_cube + pt_id)*6;
-
-        //TODO: Switch to SOA
-        double metric[6];
-        #pragma unroll
-        for (int i=0;i<6;i++)
-          metric[i] = g[offset+i];
-          //metric[i] = ld_functions::ld_cg(&g[offset+i]);
-          //metric[i] = g[offset+i];
-
-
-        // SOA HACK
-        /*
-        int offset = cell_id*p_cube + pt_id;
-
-        //TODO: Switch to SOA
-        double metric[6];
-        #pragma unroll
-        for (int i=0;i<6;i++)
-        {
-          //metric[i] = g[offset];
-          metric[i] = ld_functions::ld_cg(&g[offset]);
-          offset += n_cells*p_cube;
-        }
-        */
-
-
-
-          //metric[i] = ld_functions::ld_cg(&(g[offset+i]));
-
-        double wr = metric[0]*ur + metric[1]*us + metric[2]*ut;
-        double ws = metric[1]*ur + metric[3]*us + metric[4]*ut;
-        double wt = metric[2]*ur + metric[4]*us + metric[5]*ut;
-
-        ur = wr;
-        us = ws;
-        ut = wt;
-      }
-
-      // Store ur in shared memory
-      temp[tid] = ur;
-      __syncthreads();
-
-      // Now that data is loaded in shared, compute wa
-
-      {
-        int d_offset  = tid_mod_p;
-        int s_offset = tid_div_p*p;
-
-        #pragma unroll
-        for (int i=0;i<p;i++)
-          wa[k] += __ldg(&dxtm1[d_offset+p*i])*temp[s_offset + i];
-      }
-
-      __syncthreads();
-      temp[tid] = us;
-      __syncthreads();
-
-      // Compute us
-      {
-
-        int plane = tid_div_p_sq;
-        int s_offset = plane*p_sq + tid_mod_p;
-        int d_offset = p*( (tid-plane*p_sq)/p);
-
-        #pragma unroll
-        for (int i=0;i<p;i++)
-          wa[k] += temp[s_offset + p*i]*__ldg(&dxm1[d_offset + i]);
-      }
-
-      __syncthreads();
-      // Store ut in shared memory
-      temp[tid] = ut;
-      __syncthreads();
-
-      #pragma unroll
-      for (int k2=0;k2<pts_per_thread;k2++)
-      {
-        int i_start = k*slab_size;
-        int pt_id_2 = k2*cta_size + tid;
-        int plane = pt_id_2/p_sq;
-
-        int s_offset = tid_mod_p_sq;
-        int d_offset = plane*p;
-
-        #pragma unroll
-        for (int i_count=0; i_count < slab_size; i_count++)
-        {
-          wa[k2] += temp[s_offset + p_sq*i_count]*__ldg(&dxm1[d_offset + i_start]);
-          i_start++;
-        }
-      }
-      __syncthreads();
-
-    } // Loop over k
-
-    #pragma unroll
-    for (int k=0;k<pts_per_thread;k++)
-    {
-      int pt_id = k*cta_size + tid;
-      w[offset + pt_id] = wa[k];
-    }
-  } // Loop over blocks
-
-}
-
-template<int p, int p_sq, int p_cube, int p_cube_padded, int cta_size>
-__global__
-void ax_cuda_kernel_v6(const double* __restrict__ u_global, double* __restrict__ w, const double* __restrict__ g, const double* __restrict__ dxm1, const double* __restrict__ dxtm1, int n_cells)
-{
-  int tid = threadIdx.x;
-  __shared__ double temp[cta_size];
-
-  double u[p], wa[p];
-
-  for (int cell_id=blockIdx.x; cell_id < n_cells; cell_id += gridDim.x)
-  {
-    // Load u in shared for the entire cell
-    int offset = cell_id*p_cube;
-    #pragma unroll
-    for (int k=0;k<p;k++)
-    {
-      int pt_id = k*cta_size + tid;
-      u[k] = ld_functions::ld_cg(&u_global[offset + pt_id]);
-    }
-
-    __syncthreads();
-
-    // Initialize wa to 0.
-    #pragma unroll
-    for (int k=0;k<p;k++)
-      wa[k] = 0.;
-
-    // Now compute w for one slab at a time
-    #pragma unroll
-    for (int k=0;k<p;k++)
-    {
-      int pt_id = k*cta_size + tid;
-      int pt_id_div_p = pt_id/p;
-      int pt_id_mod_p = pt_id%p;
-      int pt_id_div_p_sq = pt_id/p_sq;
-      int pt_id_mod_p_sq = pt_id%p_sq;
-
-      double ur, us, ut;
-
-      // Load in shared
-      __syncthreads();
-      temp[tid] = u[k];
-      __syncthreads();
-
-      //  Now that data is loaded in shared, compute ur
-      {
-        int s_offset = pt_id_div_p*p;
-        int d_offset  = pt_id_mod_p;
-
-        ur = 0.;
-        #pragma unroll
-        for (int i=0;i<p;i++)
-          ur += __ldg(&dxm1[d_offset + p*i])*temp[s_offset + i];
-      }
-
-      // Compute us
-      {
-        int plane = pt_id_div_p_sq;
-        int s_offset = plane*p_sq + pt_id_mod_p;
-        int d_offset = p*( (pt_id-plane*p_sq)/p);
-
-        us = 0.;
-        #pragma unroll
-        for (int i=0;i<p;i++)
-          us += temp[s_offset + p*i]*__ldg(&dxtm1[d_offset + i]);
-      }
-
-      // Compute ut
-      {
-        int s_offset = pt_id_mod_p_sq;
-        int d_offset = pt_id_div_p_sq*p;
-
-        ut = 0.;
-        #pragma unroll
-        for (int i=0;i<p;i++)
-          ut += u[i]*__ldg(&dxtm1[d_offset + i]);
-      }
-
-      // Transform
-      {
-
-        int offset = (cell_id*p_cube + pt_id)*6;
-
-        //TODO: Switch to SOA
-        double metric[6];
-        #pragma unroll
-        for (int i=0;i<6;i++)
-          metric[i] = g[offset+i];
-
-        // SOA HACK
-        /*
-        int offset = cell_id*p_cube + pt_id;
-
-        //TODO: Switch to SOA
-        double metric[6];
-        #pragma unroll
-        for (int i=0;i<6;i++)
-        {
-          //metric[i] = g[offset];
-          metric[i] = ld_functions::ld_cg(&g[offset]);
-          offset += n_cells*p_cube;
-        }
-        */
-        //metric[i] = ld_functions::ld_cg(&(g[offset+i]));
-
-        double wr = metric[0]*ur + metric[1]*us + metric[2]*ut;
-        double ws = metric[1]*ur + metric[3]*us + metric[4]*ut;
-        double wt = metric[2]*ur + metric[4]*us + metric[5]*ut;
-
-        ur = wr;
-        us = ws;
-        ut = wt;
-      }
-
-      // Store ur in shared memory
-      __syncthreads();
-      temp[tid] = ur;
-      __syncthreads();
-
-      // Now that data is loaded in shared, compute wa
-      int tid_mod_p = tid%p;
-      int tid_div_p = tid/p;
-      int tid_mod_p_sq = tid%p_sq;
-      int tid_div_p_sq = tid/p_sq;
-
-      {
-        int d_offset  = tid_mod_p;
-        int s_offset = tid_div_p*p;
-
-        #pragma unroll
-        for (int i=0;i<p;i++)
-          wa[k] += __ldg(&dxtm1[d_offset+p*i])*temp[s_offset + i];
-      }
-
-      __syncthreads();
-      temp[tid] = us;
-      __syncthreads();
-
-      // Compute us
-      {
-
-        int plane = tid_div_p_sq;
-        int s_offset = plane*p_sq + tid_mod_p;
-        int d_offset = p*( (tid-plane*p_sq)/p);
-        int stride = p;
-
-        #pragma unroll
-        for (int i=0;i<p;i++)
-          wa[k] += temp[s_offset + stride*i]*__ldg(&dxm1[d_offset + i]);
-      }
-
-      __syncthreads();
-      // Store ut in shared memory
-      temp[tid] = ut;
-      __syncthreads();
-
-      #pragma unroll
-      for (int k2=0;k2<p;k2++)
-      {
-        int pt_id_2 = k2*cta_size + tid;
-        int plane = pt_id_2/p_sq;
-
-        int s_offset = tid_mod_p_sq;
-        int d_offset = plane*p;
-
-        wa[k2] += temp[s_offset]*__ldg(&dxm1[d_offset + k]);
-      }
-      __syncthreads();
-
-    } // Loop over k
-
-    #pragma unroll
-    for (int k=0;k<p;k++)
-    {
-      int pt_id = k*cta_size + tid;
-      w[offset + pt_id] = wa[k];
-    }
-  } // Loop over blocks
-
-}
-
-
-template<int p, int p_sq, int p_cube, int p_cube_padded, int pts_per_thread, int slab_size, int cta_size>
-__global__
-__launch_bounds__(432,2)
-//__launch_bounds__(144,6)
-void ax_cuda_kernel_v3(const double* __restrict__ u, double* __restrict__ w, const double* __restrict__ g, const double* __restrict__ dxm1, const double* __restrict__ dxtm1, int n_cells)
-{
-  int tid = threadIdx.x;
-  __shared__ double s_u[p_cube];
-  __shared__ double temp[cta_size];
-
-  for (int cell_id=blockIdx.x; cell_id < n_cells; cell_id += gridDim.x)
-  {
-    // Load u in shared for the entire cell
-    int offset = cell_id*p_cube;
-    #pragma unroll
-    for (int k=0;k<pts_per_thread;k++)
-    {
-      int pt_id = k*cta_size + tid;
-      s_u[pt_id] = ld_functions::ld_cg(&u[offset + pt_id]);
-      //s_u[pt_id] = u[offset + pt_id];
-    }
-
-    __syncthreads();
-
-    // Initialize wa to 0.
-    double wa[pts_per_thread];
-    #pragma unroll
-    for (int k=0;k<pts_per_thread;k++)
-    {
-      wa[k] = 0.;
-    }
-
-    // Now compute w for one slab at a time
-    for (int k=0;k<pts_per_thread;k++)
-    {
-      int pt_id = k*cta_size + tid;
-      int pt_id_div_p = pt_id/p;
-      int pt_id_mod_p = pt_id%p;
-      int pt_id_div_p_sq = pt_id/p_sq;
-      int pt_id_mod_p_sq = pt_id%p_sq;
-
-      double ur, us, ut;
-
-      //  Now that data is loaded in shared, compute ur
-      {
-        int s_offset = pt_id_div_p*p;
-        int d_offset  = pt_id_mod_p;
-
-        ur = 0.;
-        #pragma unroll
-        for (int i=0;i<p;i++)
-          ur += __ldg(&dxm1[d_offset + p*i])*s_u[s_offset + i];
-      }
-
-      // Compute us
-      {
-        int plane = pt_id_div_p_sq;
-        int s_offset = plane*p_sq + pt_id_mod_p;
-        int d_offset = p*( (pt_id-plane*p_sq)/p);
-
-        us = 0.;
-        #pragma unroll
-        for (int i=0;i<p;i++)
-          us += s_u[s_offset + p*i]*__ldg(&dxtm1[d_offset + i]);
-      }
-
-      // Compute ut
-      {
-        int s_offset = pt_id_mod_p_sq;
-        int d_offset = pt_id_div_p_sq*p;
-
-        ut = 0.;
-        #pragma unroll
-        for (int i=0;i<p;i++)
-          ut += s_u[s_offset + p_sq*i]*__ldg(&dxtm1[d_offset + i]);
-      }
-
-      // Transform
-      {
-
-        int offset = (cell_id*p_cube + pt_id)*6;
-
-        //TODO: Switch to SOA
-        double metric[6];
-        #pragma unroll
-        for (int i=0;i<6;i++)
-          metric[i] = g[offset+i];
-
-
-        // SOA HACK
-        /*
-        int offset = cell_id*p_cube + pt_id;
-
-        //TODO: Switch to SOA
-        double metric[6];
-        #pragma unroll
-        for (int i=0;i<6;i++)
-        {
-          //metric[i] = g[offset];
-          metric[i] = ld_functions::ld_cg(&g[offset]);
-          offset += n_cells*p_cube;
-        }
-        */
-
-
-
-          //metric[i] = ld_functions::ld_cg(&(g[offset+i]));
-
-        double wr = metric[0]*ur + metric[1]*us + metric[2]*ut;
-        double ws = metric[1]*ur + metric[3]*us + metric[4]*ut;
-        double wt = metric[2]*ur + metric[4]*us + metric[5]*ut;
-
-        ur = wr;
-        us = ws;
-        ut = wt;
-      }
-
-      // Store ur in shared memory
-      temp[tid] = ur;
-      __syncthreads();
-
-      // Now that data is loaded in shared, compute wa
-      int tid_mod_p = tid%p;
-      int tid_div_p = tid/p;
-      int tid_mod_p_sq = tid%p_sq;
-      int tid_div_p_sq = tid/p_sq;
-
-      {
-        int d_offset  = tid_mod_p;
-        int s_offset = tid_div_p*p;
-
-        #pragma unroll
-        for (int i=0;i<p;i++)
-          wa[k] += __ldg(&dxtm1[d_offset+p*i])*temp[s_offset + i];
-      }
-
-      __syncthreads();
-      temp[tid] = us;
-      __syncthreads();
-
-      // Compute us
-      {
-
-        int plane = tid_div_p_sq;
-        int s_offset = plane*p_sq + tid_mod_p;
-        int d_offset = p*( (tid-plane*p_sq)/p);
-        int stride = p;
-
-        #pragma unroll
-        for (int i=0;i<p;i++)
-          wa[k] += temp[s_offset + stride*i]*__ldg(&dxm1[d_offset + i]);
-      }
-
-      __syncthreads();
-      // Store ut in shared memory
-      temp[tid] = ut;
-      __syncthreads();
-
-      #pragma unroll
-      for (int k2=0;k2<pts_per_thread;k2++)
-      {
-        int i_start = k*slab_size;
-        int pt_id_2 = k2*cta_size + tid;
-        int plane = pt_id_2/p_sq;
-
-        int s_offset = tid_mod_p_sq;
-        int d_offset = plane*p;
-
-        #pragma unroll
-        for (int i_count=0; i_count < slab_size; i_count++)
-        {
-          wa[k2] += temp[s_offset + p_sq*i_count]*__ldg(&dxm1[d_offset + i_start]);
-          i_start++;
-        }
-      }
-      __syncthreads();
-
-    } // Loop over k
-
-    #pragma unroll
-    for (int k=0;k<pts_per_thread;k++)
-    {
-      int pt_id = k*cta_size + tid;
-      w[offset + pt_id] = wa[k];
-    }
-  } // Loop over blocks
-
-}
-
-
-
-template<int p, int p_sq, int p_cube, int p_cube_padded, int pts_per_thread, int cta_size>
-//__launch_bounds__(288,2)
-__global__
-void ax_cuda_kernel_v2(double* __restrict__ u, double* __restrict__ w, double* __restrict__ g, double* __restrict__ dxm1, double* __restrict__ dxtm1, int n_cells)
-{
-  int tid = threadIdx.x;
-  __shared__ double s_u[p_cube];
-  __shared__ double temp[cta_size];
-
-  int slab_size = p/pts_per_thread;
-
-  for (int cell_id=blockIdx.x; cell_id < n_cells; cell_id += gridDim.x)
-  {
-    //int cell_id = blockIdx.x;
-
-    // Load u in shared for the entire cell
-    int offset = cell_id*p_cube;
-    #pragma unroll
-    for (int k=0;k<pts_per_thread;k++)
-    {
-      int pt_id = k*cta_size + tid;
-      s_u[pt_id] = u[offset + pt_id];
-    }
-
-    __syncthreads();
-
-    // Initialize wa to 0.
-    double wa[pts_per_thread];
-    #pragma unroll
-    for (int k=0;k<pts_per_thread;k++)
-      wa[k] = 0.;
-
-    // Now compute w for one slab at a time
-    #pragma unroll
-    for (int k=0;k<pts_per_thread;k++)
-    {
-      int pt_id = k*cta_size + tid;
-
-      double ur, us, ut;
-
-      //  Now that data is loaded in shared, compute ur
-      {
-        int line = pt_id/p;
-        int s_offset = line*p;
-
-        int d_offset  = pt_id%p;
-        int stride = p;
-
-        ur = 0.;
-        #pragma unroll
-        for (int i=0;i<p;i++)
-          ur += __ldg(&dxm1[d_offset + stride*i])*s_u[s_offset + i];
-      }
-
-      // Compute us
-      {
-        int pt_id_mod_p = pt_id%p;
-        int pt_id_div_p = pt_id/p;
-
-        int plane = pt_id/p_sq;
-        int s_offset = plane*p_sq + pt_id_mod_p;
-        int d_offset = p*( (pt_id-plane*p_sq)/p);
-        int stride = p;
-
-        us = 0.;
-        #pragma unroll
-        for (int i=0;i<p;i++)
-          us += s_u[s_offset + stride*i]*__ldg(&dxtm1[d_offset + i]);
-      }
-
-      // Compute ut
-      {
-        int s_offset = pt_id%(p_sq);
-        int plane = pt_id/p_sq;
-        int d_offset = plane*p;
-        int stride = p_sq;
-
-        ut = 0.;
-        #pragma unroll
-        for (int i=0;i<p;i++)
-          ut += s_u[s_offset + stride*i]*__ldg(&dxtm1[d_offset + i]);
-      }
-
-      // Transform
-      {
-        int offset = (cell_id*p_cube + pt_id)*6;
-
-        //TODO: Switch to SOA
-        double metric[6];
-        #pragma unroll
-        for (int i=0;i<6;i++)
-          metric[i] = g[offset+i];
-
-        double wr = metric[0]*ur + metric[1]*us + metric[2]*ut;
-        double ws = metric[1]*ur + metric[3]*us + metric[4]*ut;
-        double wt = metric[2]*ur + metric[4]*us + metric[5]*ut;
-
-        ur = wr;
-        us = ws;
-        ut = wt;
-      }
-
-      // Store ur in shared memory
-      temp[tid] = ur;
-      __syncthreads();
-
-      // Now that data is loaded in shared, compute wa
-      {
-        int d_offset  = tid%p;
-        int line = tid/p;
-        int s_offset = line*p;
-        int stride = p;
-
-        #pragma unroll
-        for (int i=0;i<p;i++)
-          wa[k] += __ldg(&dxtm1[d_offset+stride*i])*temp[s_offset + i];
-      }
-
-      __syncthreads();
-      temp[tid] = us;
-      __syncthreads();
-
-      // Compute us
-      {
-        int tid_mod_p = tid%p;
-        int tid_div_p = tid/p;
-
-        int plane = tid/p_sq;
-        int s_offset = plane*p_sq + tid_mod_p;
-        int d_offset = p*( (tid-plane*p_sq)/p);
-        int stride = p;
-
-        #pragma unroll
-        for (int i=0;i<p;i++)
-          wa[k] += temp[s_offset + stride*i]*__ldg(&dxm1[d_offset + i]);
-      }
-
-      __syncthreads();
-      // Store ut in shared memory
-      temp[tid] = ut;
-      __syncthreads();
-
-      #pragma unroll
-      for (int k2=0;k2<pts_per_thread;k2++)
-      {
-        int pt_id = k2*cta_size + tid;
-        int s_offset = tid%(p_sq);
-        int plane = pt_id/p_sq;
-        int d_offset = plane*p;
-        int stride = p_sq;
-
-        int i_start = k*slab_size;
-        int i_end = (k+1)*slab_size;
-        int i_count = 0;
-        #pragma unroll
-        for (int i=i_start;i<i_end;i++)
-        {
-          wa[k2] += temp[s_offset + stride*i_count]*__ldg(&dxm1[d_offset + i]);
-          i_count++;
-        }
-      }
-
-    } // Loop over k
-
-    #pragma unroll
-    for (int k=0;k<pts_per_thread;k++)
-    {
-      int pt_id = k*cta_size + tid;
-      w[offset + pt_id] = wa[k];
-    }
-  } // Loop over blocks
-
-}
-template<int p, int p_cube, int p_cube_padded, int cta_size>
-__global__
-//__launch_bounds__(729,1)
-void ax_cuda_kernel_v9(double* __restrict__ u, double* __restrict__ w, double* __restrict__ g, double* __restrict__ dxm1, double* __restrict__ dxtm1, int n_cells)
-{
-  int tid = threadIdx.x;
-
-  __shared__ double s_u[p_cube];
-
-  for (int cell_id=blockIdx.x; cell_id < n_cells; cell_id += gridDim.x)
-  {
-    int cell_id = blockIdx.x;
-
-    double ur,us,ut,wa;
-
-    int offset = cell_id*p_cube;
-    s_u[tid] = u[offset + tid];
-
-    __syncthreads();
-
-    int tid_mod_p = tid%p;
-    int tid_div_p = tid/p;
-    int p_sq = p*p;
-    int tid_mod_psq = tid%p_sq;
-    int tid_div_psq = tid/p_sq;
-
-    //  Now that data is loaded in shared, compute ur
-    {
-      int line = tid_div_p;
-      int s_offset = line*p;
-
-      int d_offset  = tid_mod_p;
-      int stride = p;
-
-      ur = 0.;
-      #pragma unroll
-      for (int i=0;i<p;i++)
-        ur += dxm1[d_offset + stride*i]*s_u[s_offset + i];
-    }
-
-    // Compute us
-    {
-      int plane = tid_div_psq;
-      int s_offset = plane*p_sq + tid_mod_p;
-      int d_offset = p*( (tid-plane*p_sq)/p);
-      int stride = p;
-
-      us = 0.;
-      #pragma unroll
-      for (int i=0;i<p;i++)
-        us += s_u[s_offset + stride*i]*__ldg(&dxtm1[d_offset + i]);
-
-    }
-
-    // Compute ut
-    {
-
-      int s_offset = tid_mod_psq;
-      int plane = tid_div_psq;
-      int d_offset = plane*p;
-      int stride = p_sq;
-
-      ut = 0.;
-      #pragma unroll
-      for (int i=0;i<p;i++)
-        ut += s_u[s_offset + stride*i]*__ldg(&dxtm1[d_offset + i]);
-    }
-
-    // Transform
-    {
-      int offset = (cell_id*p_cube + tid)*6;
-
-      //TODO: Switch to SOA
-      double metric[6];
-      #pragma unroll
-      for (int i=0;i<6;i++)
-        metric[i] = g[offset+i];
-
-      double wr = metric[0]*ur + metric[1]*us + metric[2]*ut;
-      double ws = metric[1]*ur + metric[3]*us + metric[4]*ut;
-      double wt = metric[2]*ur + metric[4]*us + metric[5]*ut;
-
-      ur = wr;
-      us = ws;
-      ut = wt;
-    }
-
-    // Store ur in shared memory
-
-    // Wait for all threads to be done with data in s_u
-    __syncthreads();
-
-    s_u[tid] = ur;
-    __syncthreads();
-
-    // Wait for all threads to have loaded data in s_u
-
-    // Now that data is loaded in shared, compute wa
-    {
-      int d_offset  = tid_mod_p;
-      int line = tid_div_p;
-      int s_offset = line*p;
-      int stride = p;
-
-      wa = 0.;
-      #pragma unroll
-      for (int i=0;i<p;i++)
-        wa += __ldg(&dxtm1[d_offset+stride*i])*s_u[s_offset + i];
-    }
-
-    __syncthreads();
-
-    // Store us in shared memory
-    s_u[tid] = us;
-
-    __syncthreads();
-
-    // Compute us
-    {
-      int plane = tid_div_psq;
-      int s_offset = plane*p_sq + tid_mod_p;
-      int d_offset = p*( (tid-plane*p_sq)/p);
-      int stride = p;
-
-      #pragma unroll
-      for (int i=0;i<p;i++)
-        wa += s_u[s_offset + stride*i]*__ldg(&dxm1[d_offset + i]);
-    }
-
-    __syncthreads();
-
-    // Store ut in shared memory
-    s_u[tid] = ut;
-
-    __syncthreads();
-
-    {
-      int s_offset = tid_mod_psq;
-      int plane = tid_div_psq;
-      int d_offset = plane*p;
-      int stride = p_sq;
-
-      #pragma unroll
-      for (int i=0;i<p;i++)
-        wa += s_u[s_offset + stride*i]*__ldg(&dxm1[d_offset + i]);
-    }
-
-    w[offset + tid] = wa;
-
-
-  } // Loop over blocks
-
-}
-
-
-
-template<int p, int p_cube, int p_cube_padded, int pts_per_thread, int cta_size>
-__global__
-//__launch_bounds__(864,1)
-__launch_bounds__(729,1)
-void ax_cuda_kernel(double* __restrict__ u, double* __restrict__ w, double* __restrict__ g, double* __restrict__ dxm1, double* __restrict__ dxtm1, int n_cells)
-{
-  int tid = threadIdx.x;
-
-  __shared__ double s_u[p_cube];
-
-  for (int cell_id=blockIdx.x; cell_id < n_cells; cell_id += gridDim.x)
-  {
-    int cell_id = blockIdx.x;
-
-    double ur[pts_per_thread];
-    double us[pts_per_thread];
-    double ut[pts_per_thread];
-
-
-    int offset = cell_id*p_cube;
-    #pragma unroll
-    for (int k=0;k<pts_per_thread;k++)
-    {
-      int pt_id = k*cta_size + tid;
-      s_u[pt_id] = u[offset + pt_id];
-    }
-
-    __syncthreads();
-
-    //  Now that data is loaded in shared, compute ur
-    #pragma unroll
-    for (int k=0;k<pts_per_thread;k++)
-    {
-      int pt_id = k*cta_size + tid;
-
-      int line = pt_id/p;
-      int s_offset = line*p;
-
-      int d_offset  = pt_id%p;
-      int stride = p;
-
-      ur[k] = 0.;
-      #pragma unroll
-      for (int i=0;i<p;i++)
-        ur[k] += dxm1[d_offset + stride*i]*s_u[s_offset + i];
-    }
-
-    // Compute us
-    #pragma unroll
-    for (int k=0;k<pts_per_thread;k++)
-    {
-      int pt_id = k*cta_size + tid;
-
-      int pt_id_mod_p = pt_id%p;
-      int pt_id_div_p = pt_id/p;
-
-      int plane = pt_id/(p*p);
-      int s_offset = plane*p*p + pt_id_mod_p;
-      int d_offset = p*( (pt_id-plane*p*p)/p);
-      int stride = p;
-
-      us[k] = 0.;
-      #pragma unroll
-      for (int i=0;i<p;i++)
-        us[k] += s_u[s_offset + stride*i]*__ldg(&dxtm1[d_offset + i]);
-
-    }
-
-    // Compute ut
-    #pragma unroll
-    for (int k=0;k<pts_per_thread;k++)
-    {
-      int pt_id = k*cta_size + tid;
-      int p_sq = p*p;
-
-      int s_offset = pt_id%(p_sq);
-      int plane = pt_id/p_sq;
-      int d_offset = plane*p;
-      int stride = p_sq;
-
-      ut[k] = 0.;
-      #pragma unroll
-      for (int i=0;i<p;i++)
-        ut[k] += s_u[s_offset + stride*i]*__ldg(&dxtm1[d_offset + i]);
-    }
-
-    // Transform
-    #pragma unroll
-    for (int k=0;k<pts_per_thread;k++)
-    {
-      int pt_id = k*cta_size + tid;
-      int offset = (cell_id*p_cube + pt_id)*6;
-
-      //TODO: Switch to SOA
-      double metric[6];
-      #pragma unroll
-      for (int i=0;i<6;i++)
-        metric[i] = g[offset+i];
-
-      double wr = metric[0]*ur[k] + metric[1]*us[k] + metric[2]*ut[k];
-      double ws = metric[1]*ur[k] + metric[3]*us[k] + metric[4]*ut[k];
-      double wt = metric[2]*ur[k] + metric[4]*us[k] + metric[5]*ut[k];
-
-      ur[k] = wr;
-      us[k] = ws;
-      ut[k] = wt;
-    }
-
-    // Store ur in shared memory
-
-    // Wait for all threads to be done with data in s_u
-    __syncthreads();
-
-    #pragma unroll
-    for (int k=0;k<pts_per_thread;k++)
-      s_u[cta_size*k + tid] = ur[k];
-
-    // Wait for all threads to have loaded data in s_u
-    __syncthreads();
-
-    double wa[pts_per_thread];
-
-    // Now that data is loaded in shared, compute wa
-    #pragma unroll
-    for (int k=0;k<pts_per_thread;k++)
-    {
-      int pt_id = k*cta_size + tid;
-
-      int d_offset  = pt_id%p;
-      int line = pt_id/p;
-      int s_offset = line*p;
-      int stride = p;
-
-      wa[k] = 0.;
-      #pragma unroll
-      for (int i=0;i<p;i++)
-        wa[k] += __ldg(&dxtm1[d_offset+stride*i])*s_u[s_offset + i];
-
-
-    }
-
-    __syncthreads();
-
-    // Store us in shared memory
-    #pragma unroll
-    for (int k=0;k<pts_per_thread;k++)
-      s_u[cta_size*k + tid] = us[k];
-
-    __syncthreads();
-
-    // Compute us
-    #pragma unroll
-    for (int k=0;k<pts_per_thread;k++)
-    {
-      int pt_id = k*cta_size + tid;
-
-      int pt_id_mod_p = pt_id%p;
-      int pt_id_div_p = pt_id/p;
-
-      int plane = pt_id/(p*p);
-      int s_offset = plane*p*p + pt_id_mod_p;
-      int d_offset = p*( (pt_id-plane*p*p)/p);
-      int stride = p;
-
-      #pragma unroll
-      for (int i=0;i<p;i++)
-        wa[k] += s_u[s_offset + stride*i]*__ldg(&dxm1[d_offset + i]);
-
-    }
-
-    __syncthreads();
-
-    // Store ut in shared memory
-    #pragma unroll
-    for (int k=0;k<pts_per_thread;k++)
-      s_u[cta_size*k + tid] = ut[k];
-
-    __syncthreads();
-
-    #pragma unroll
-    for (int k=0;k<pts_per_thread;k++)
-    {
-      int pt_id = k*cta_size + tid;
-      int p_sq = p*p;
-
-      int s_offset = pt_id%(p_sq);
-      int plane = pt_id/p_sq;
-      int d_offset = plane*p;
-      int stride = p_sq;
-
-      #pragma unroll
-      for (int i=0;i<p;i++)
-        wa[k] += s_u[s_offset + stride*i]*__ldg(&dxm1[d_offset + i]);
-    }
-
-    #pragma unroll
-    for (int k=0;k<pts_per_thread;k++)
-    {
-      int pt_id = k*cta_size + tid;
-      w[offset + pt_id] = wa[k];
-    }
-
-
-  } // Loop over blocks
-
-}
-
-
-template<int p, int p_cube, int p_cube_padded, int pts_per_thread, int cta_size>
-__global__
-__launch_bounds__(729,2)
-void ax_cuda_kernel_v12(double* __restrict__ u, double* __restrict__ w, double* __restrict__ g, double* __restrict__ dxm1, double* __restrict__ dxtm1, int n_cells)
-{
-  int tid = threadIdx.x;
-
-  __shared__ double s_u[p_cube];
-
-  for (int cell_id=blockIdx.x; cell_id < n_cells; cell_id += gridDim.x)
-  {
-    int cell_id = blockIdx.x;
-
-    double ur[pts_per_thread];
-    double us[pts_per_thread];
-    double ut[pts_per_thread];
-
-
-    int offset = cell_id*p_cube;
-    #pragma unroll
-    for (int k=0;k<pts_per_thread;k++)
-    {
-      int pt_id = k*cta_size + tid;
-      s_u[pt_id] = u[offset + pt_id];
-    }
-
-    __syncthreads();
-
-    //  Now that data is loaded in shared, compute ur
-    #pragma unroll
-    for (int k=0;k<pts_per_thread;k++)
-    {
-      int pt_id = k*cta_size + tid;
-
-      int line = pt_id/p;
-      int s_offset = line*p;
-
-      int d_offset  = pt_id%p;
-      int stride = p;
-
-      ur[k] = 0.;
-      #pragma unroll
-      for (int i=0;i<p;i++)
-        ur[k] += dxm1[d_offset + stride*i]*s_u[s_offset + i];
-    }
-
-    // Compute us
-    #pragma unroll
-    for (int k=0;k<pts_per_thread;k++)
-    {
-      int pt_id = k*cta_size + tid;
-
-      int pt_id_mod_p = pt_id%p;
-      int pt_id_div_p = pt_id/p;
-
-      int plane = pt_id/(p*p);
-      int s_offset = plane*p*p + pt_id_mod_p;
-      int d_offset = p*( (pt_id-plane*p*p)/p);
-      int stride = p;
-
-      us[k] = 0.;
-      #pragma unroll
-      for (int i=0;i<p;i++)
-        us[k] += s_u[s_offset + stride*i]*__ldg(&dxtm1[d_offset + i]);
-
-    }
-
-    // Compute ut
-    #pragma unroll
-    for (int k=0;k<pts_per_thread;k++)
-    {
-      int pt_id = k*cta_size + tid;
-      int p_sq = p*p;
-
-      int s_offset = pt_id%(p_sq);
-      int plane = pt_id/p_sq;
-      int d_offset = plane*p;
-      int stride = p_sq;
-
-      ut[k] = 0.;
-      #pragma unroll
-      for (int i=0;i<p;i++)
-        ut[k] += s_u[s_offset + stride*i]*__ldg(&dxtm1[d_offset + i]);
-    }
-
-    // Transform
-    #pragma unroll
-    for (int k=0;k<pts_per_thread;k++)
-    {
-      int pt_id = k*cta_size + tid;
-      int offset = (cell_id*p_cube + pt_id)*6;
-
-      //TODO: Switch to SOA
-      double metric[6];
-      #pragma unroll
-      for (int i=0;i<6;i++)
-        metric[i] = g[offset+i];
-
-      double wr = metric[0]*ur[k] + metric[1]*us[k] + metric[2]*ut[k];
-      double ws = metric[1]*ur[k] + metric[3]*us[k] + metric[4]*ut[k];
-      double wt = metric[2]*ur[k] + metric[4]*us[k] + metric[5]*ut[k];
-
-      ur[k] = wr;
-      us[k] = ws;
-      ut[k] = wt;
-    }
-
-    // Store ur in shared memory
-
-    // Wait for all threads to be done with data in s_u
-    __syncthreads();
-
-    #pragma unroll
-    for (int k=0;k<pts_per_thread;k++)
-      s_u[cta_size*k + tid] = ur[k];
-
-    // Wait for all threads to have loaded data in s_u
-    __syncthreads();
-
-    double wa[pts_per_thread];
-
-    // Now that data is loaded in shared, compute wa
-    #pragma unroll
-    for (int k=0;k<pts_per_thread;k++)
-    {
-      int pt_id = k*cta_size + tid;
-
-      int d_offset  = pt_id%p;
-      int line = pt_id/p;
-      int s_offset = line*p;
-      int stride = p;
-
-      wa[k] = 0.;
-      #pragma unroll
-      for (int i=0;i<p;i++)
-        wa[k] += __ldg(&dxtm1[d_offset+stride*i])*s_u[s_offset + i];
-
-
-    }
-
-    __syncthreads();
-
-    // Store us in shared memory
-    #pragma unroll
-    for (int k=0;k<pts_per_thread;k++)
-      s_u[cta_size*k + tid] = us[k];
-
-    __syncthreads();
-
-    // Compute us
-    #pragma unroll
-    for (int k=0;k<pts_per_thread;k++)
-    {
-      int pt_id = k*cta_size + tid;
-
-      int pt_id_mod_p = pt_id%p;
-      int pt_id_div_p = pt_id/p;
-
-      int plane = pt_id/(p*p);
-      int s_offset = plane*p*p + pt_id_mod_p;
-      int d_offset = p*( (pt_id-plane*p*p)/p);
-      int stride = p;
-
-      #pragma unroll
-      for (int i=0;i<p;i++)
-        wa[k] += s_u[s_offset + stride*i]*__ldg(&dxm1[d_offset + i]);
-
-    }
-
-    __syncthreads();
-
-    // Store ut in shared memory
-    #pragma unroll
-    for (int k=0;k<pts_per_thread;k++)
-      s_u[cta_size*k + tid] = ut[k];
-
-    __syncthreads();
-
-    #pragma unroll
-    for (int k=0;k<pts_per_thread;k++)
-    {
-      int pt_id = k*cta_size + tid;
-      int p_sq = p*p;
-
-      int s_offset = pt_id%(p_sq);
-      int plane = pt_id/p_sq;
-      int d_offset = plane*p;
-      int stride = p_sq;
-
-      #pragma unroll
-      for (int i=0;i<p;i++)
-        wa[k] += s_u[s_offset + stride*i]*__ldg(&dxm1[d_offset + i]);
-    }
-
-    #pragma unroll
-    for (int k=0;k<pts_per_thread;k++)
-    {
-      int pt_id = k*cta_size + tid;
-      w[offset + pt_id] = wa[k];
-    }
-
-
-  } // Loop over blocks
-
-}
-
-
-template<int p, int p_cube, int p_cube_padded, int cta_size>
-__global__
-//__launch_bounds__(864,1)
-//__launch_bounds__(729,1)
-void ax_cuda_kernel_v11(double* __restrict__ u, double* __restrict__ w, double* __restrict__ g, double* __restrict__ dxm1, double* __restrict__ dxtm1, int n_cells)
-{
-  int tid = threadIdx.x;
-
-  __shared__ double s_u[p_cube];
-
-  for (int cell_id=blockIdx.x; cell_id < n_cells; cell_id += gridDim.x)
-  {
-    int cell_id = blockIdx.x;
-
-    double ur[1];
-    double us[1];
-    double ut[1];
-
-    int offset = cell_id*p_cube;
-    {
-      int pt_id =  tid;
-      s_u[pt_id] = u[offset + pt_id];
-    }
-
-    __syncthreads();
-
-    //  Now that data is loaded in shared, compute ur
-    {
-      int pt_id = tid;
-
-      int line = pt_id/p;
-      int s_offset = line*p;
-
-      int d_offset  = pt_id%p;
-      int stride = p;
-
-      ur[0] = 0.;
-      #pragma unroll
-      for (int i=0;i<p;i++)
-        ur[0] += dxm1[d_offset + stride*i]*s_u[s_offset + i];
-    }
-
-    // Compute us
-    {
-      int pt_id = tid;
-
-      int pt_id_mod_p = pt_id%p;
-      int pt_id_div_p = pt_id/p;
-
-      int plane = pt_id/(p*p);
-      int s_offset = plane*p*p + pt_id_mod_p;
-      int d_offset = p*( (pt_id-plane*p*p)/p);
-      int stride = p;
-
-      us[0] = 0.;
-      #pragma unroll
-      for (int i=0;i<p;i++)
-        us[0] += s_u[s_offset + stride*i]*__ldg(&dxtm1[d_offset + i]);
-
-    }
-
-    // Compute ut
-    {
-      int pt_id = tid;
-      int p_sq = p*p;
-
-      int s_offset = pt_id%(p_sq);
-      int plane = pt_id/p_sq;
-      int d_offset = plane*p;
-      int stride = p_sq;
-
-      ut[0] = 0.;
-      #pragma unroll
-      for (int i=0;i<p;i++)
-        ut[0] += s_u[s_offset + stride*i]*__ldg(&dxtm1[d_offset + i]);
-    }
-
-    // Transform
-    {
-      int pt_id = tid;
-      int offset = (cell_id*p_cube + pt_id)*6;
-
-      //TODO: Switch to SOA
-      double metric[6];
-      #pragma unroll
-      for (int i=0;i<6;i++)
-        metric[i] = g[offset+i];
-
-      double wr = metric[0]*ur[0] + metric[1]*us[0] + metric[2]*ut[0];
-      double ws = metric[1]*ur[0] + metric[3]*us[0] + metric[4]*ut[0];
-      double wt = metric[2]*ur[0] + metric[4]*us[0] + metric[5]*ut[0];
-
-      ur[0] = wr;
-      us[0] = ws;
-      ut[0] = wt;
-    }
-
-    // Store ur in shared memory
-
-    // Wait for all threads to be done with data in s_u
-    __syncthreads();
-
-      s_u[tid] = ur[0];
-
-    // Wait for all threads to have loaded data in s_u
-    __syncthreads();
-
-    double wa[1];
-
-    // Now that data is loaded in shared, compute wa
-    {
-      int pt_id = tid;
-
-      int d_offset  = pt_id%p;
-      int line = pt_id/p;
-      int s_offset = line*p;
-      int stride = p;
-
-      wa[0] = 0.;
-      #pragma unroll
-      for (int i=0;i<p;i++)
-        wa[0] += __ldg(&dxtm1[d_offset+stride*i])*s_u[s_offset + i];
-
-
-    }
-
-    __syncthreads();
-
-    // Store us in shared memory
-      s_u[tid] = us[0];
-
-    __syncthreads();
-
-    // Compute us
-    {
-      int pt_id = tid;
-
-      int pt_id_mod_p = pt_id%p;
-      int pt_id_div_p = pt_id/p;
-
-      int plane = pt_id/(p*p);
-      int s_offset = plane*p*p + pt_id_mod_p;
-      int d_offset = p*( (pt_id-plane*p*p)/p);
-      int stride = p;
-
-      #pragma unroll
-      for (int i=0;i<p;i++)
-        wa[0] += s_u[s_offset + stride*i]*__ldg(&dxm1[d_offset + i]);
-
-    }
-
-    __syncthreads();
-
-    // Store ut in shared memory
-      s_u[tid] = ut[0];
-
-    __syncthreads();
-
-    {
-      int pt_id = tid;
-      int p_sq = p*p;
-
-      int s_offset = pt_id%(p_sq);
-      int plane = pt_id/p_sq;
-      int d_offset = plane*p;
-      int stride = p_sq;
-
-      #pragma unroll
-      for (int i=0;i<p;i++)
-        wa[0] += s_u[s_offset + stride*i]*__ldg(&dxm1[d_offset + i]);
-    }
-
-    {
-      int pt_id = tid;
-      w[offset + pt_id] = wa[0];
-    }
-
-
-  } // Loop over blocks
-
-}
-
-
-
-template<int p, int p_cube, int p_cube_padded,  int cta_size>
-__global__
-//__launch_bounds__(864,1)
-__launch_bounds__(729,1)
-void ax_cuda_kernel_v10(double* __restrict__ u, double* __restrict__ w, double* __restrict__ g, double* __restrict__ dxm1, double* __restrict__ dxtm1, int n_cells)
-{
-  int tid = threadIdx.x;
-
-  __shared__ double s_u[p_cube];
-
-  for (int cell_id=blockIdx.x; cell_id < n_cells; cell_id += gridDim.x)
-  {
-    int cell_id = blockIdx.x;
-
-    double ur;
-    double us;
-    double ut;
-
-    int offset = cell_id*p_cube;
-    s_u[tid] = u[offset + tid];
-
-    __syncthreads();
-
-    //  Now that data is loaded in shared, compute ur
-    {
-      int pt_id = tid;
-
-      int line = pt_id/p;
-      int s_offset = line*p;
-
-      int d_offset  = pt_id%p;
-      int stride = p;
-
-      ur = 0.;
-      #pragma unroll
-      for (int i=0;i<p;i++)
-        ur += dxm1[d_offset + stride*i]*s_u[s_offset + i];
-    }
-
-    // Compute us
-    {
-      int pt_id = tid;
-
-      int pt_id_mod_p = pt_id%p;
-      int pt_id_div_p = pt_id/p;
-
-      int plane = pt_id/(p*p);
-      int s_offset = plane*p*p + pt_id_mod_p;
-      int d_offset = p*( (pt_id-plane*p*p)/p);
-      int stride = p;
-
-      us = 0.;
-      #pragma unroll
-      for (int i=0;i<p;i++)
-        us += s_u[s_offset + stride*i]*__ldg(&dxtm1[d_offset + i]);
-
-    }
-
-    // Compute ut
-    {
-      int pt_id = tid;
-      int p_sq = p*p;
-
-      int s_offset = pt_id%(p_sq);
-      int plane = pt_id/p_sq;
-      int d_offset = plane*p;
-      int stride = p_sq;
-
-      ut = 0.;
-      #pragma unroll
-      for (int i=0;i<p;i++)
-        ut += s_u[s_offset + stride*i]*__ldg(&dxtm1[d_offset + i]);
-    }
-
-    // Transform
-    {
-      int pt_id =  tid;
-      int offset = (cell_id*p_cube + pt_id)*6;
-
-      //TODO: Switch to SOA
-      double metric[6];
-      #pragma unroll
-      for (int i=0;i<6;i++)
-        metric[i] = g[offset+i];
-
-      double wr = metric[0]*ur + metric[1]*us + metric[2]*ut;
-      double ws = metric[1]*ur + metric[3]*us + metric[4]*ut;
-      double wt = metric[2]*ur + metric[4]*us + metric[5]*ut;
-
-      ur = wr;
-      us = ws;
-      ut = wt;
-    }
-
-    // Store ur in shared memory
-
-    // Wait for all threads to be done with data in s_u
-    __syncthreads();
-
-    s_u[tid] = ur;
-
-    // Wait for all threads to have loaded data in s_u
-    __syncthreads();
-
-    double wa;
-
-    // Now that data is loaded in shared, compute wa
-    {
-      int pt_id = tid;
-
-      int d_offset  = pt_id%p;
-      int line = pt_id/p;
-      int s_offset = line*p;
-      int stride = p;
-
-      wa = 0.;
-      #pragma unroll
-      for (int i=0;i<p;i++)
-        wa += __ldg(&dxtm1[d_offset+stride*i])*s_u[s_offset + i];
-
-
-    }
-
-    __syncthreads();
-
-    // Store us in shared memory
-      s_u[tid] = us;
-
-    __syncthreads();
-
-    // Compute us
-    {
-      int pt_id = tid;
-
-      int pt_id_mod_p = pt_id%p;
-      int pt_id_div_p = pt_id/p;
-
-      int plane = pt_id/(p*p);
-      int s_offset = plane*p*p + pt_id_mod_p;
-      int d_offset = p*( (pt_id-plane*p*p)/p);
-      int stride = p;
-
-      #pragma unroll
-      for (int i=0;i<p;i++)
-        wa += s_u[s_offset + stride*i]*__ldg(&dxm1[d_offset + i]);
-
-    }
-
-    __syncthreads();
-
-    // Store ut in shared memory
-      s_u[tid] = ut;
-
-    __syncthreads();
-
-    {
-      int pt_id = tid;
-      int p_sq = p*p;
-
-      int s_offset = pt_id%(p_sq);
-      int plane = pt_id/p_sq;
-      int d_offset = plane*p;
-      int stride = p_sq;
-
-      #pragma unroll
-      for (int i=0;i<p;i++)
-        wa += s_u[s_offset + stride*i]*__ldg(&dxm1[d_offset + i]);
-    }
-
-    w[offset + tid] = wa;
-
-
-  } // Loop over blocks
-
-}
-
-
-
-  /*
-   * Matrix-vector kernel
-  */
+//
+// Matrix-vector kernel
+//
 void axcuda_e(double *w, double *u, double *g, double *dxm1, double *dxtm1, 
               int nx1, int ny1, int nz1, int nelt, int ldim) 
 {
-      //int thrdsPBlck = 128;
-      //int numBlocks = (nxyz*nelt+thrdsPBlck-1)/thrdsPBlck;
-
       if ( nx1 != ny1 || nx1 != nz1)
       {
         printf("non-cubic elements not supported in Cuda version\n");
@@ -2923,42 +663,9 @@ void axcuda_e(double *w, double *u, double *g, double *dxm1, double *dxtm1,
       {
         printf("Current implementation only tested for polynomial orders 9 and 12, exiting");
         exit(1);
-#if 0
-        /* Calculate ur, us, and ut */
-
-        gsmxm<<<numBlocks, thrdsPBlck>>>(dxm1, m1, u, m1, ur, m2*(*nelt), 1);
-        gsmxm<<<numBlocks, thrdsPBlck>>>(u, m1, dxtm1, m1, us, m1, (*nelt)*(*nz1));
-        gsmxm<<<numBlocks, thrdsPBlck>>>(u, m2, dxtm1, m1, ut, m1, *nelt);
-
-        /* calculate geom effects */
-
-        geom<<<numBlocks, thrdsPBlck>>>(nxyz*(*nelt), ur, us, ut, g);
-
-        /* calculate u from ur, us, ut */
-
-        gsmxm<<<numBlocks,thrdsPBlck>>>(dxtm1, m1, ur, m1, w, m2*(*nelt), 1);
-        gsmxm<<<numBlocks, thrdsPBlck>>>(us, m1, dxm1, m1, u, m1, (*nelt)*(*nz1));
-        gadd2<<<numBlocks,thrdsPBlck>>>(w, u, nxyz*(*nelt));
-        gsmxm<<<numBlocks, thrdsPBlck>>>(ut, m2, dxm1, m1, u, m1, *nelt);
-        gadd2<<<numBlocks,thrdsPBlck>>>(w, u, nxyz*(*nelt));
-#endif
-
       }
       else if ( nx1 == 9 )
       {
-
-#if 0 
-        const int grid_size = *nelt;
-        const int p = 9;
-        const int p_sq = 9*9;
-        const int p_cube = 9*9*9;
-        const int p_cube_padded = p_cube;
-
-        const int cta_size = 729;
-               
-        ax_cuda_kernel_v12<p,p_cube,p_cube_padded,1,cta_size><<<grid_size,cta_size>>>(d_u, d_w, d_g, d_dxm1, d_dxtm1, *nelt);
-#else
-
         const int grid_size = nelt;
         const int p = 9;
         const int p_sq = 9*9;
@@ -2971,34 +678,11 @@ void axcuda_e(double *w, double *u, double *g, double *dxm1, double *dxtm1,
 
         const int num_ctas = 4;
 
-        ax_cuda_kernel_v8_shared_D<p,p_sq,p_cube,p_cube_padded,pts_per_thread,slab_size,cta_size,num_ctas><<<grid_size,cta_size>>>(u, w, g, dxm1, dxtm1, nelt);
-#endif
+        ax_cuda_kernel_v8_shared_D<p,p_sq,p_cube,p_cube_padded,pts_per_thread,slab_size,cta_size,num_ctas>
+          <<<grid_size,cta_size>>>(u, w, g, dxm1, dxtm1, nelt);
       }
       else if ( nx1 == 12 )
       {
-#if 0
-        // 12x12x12 case
-        const int cta_size = 432;
-        //const int cta_size = 144;
-        const int p = 12;
-        const int p_sq = 12*12;
-        const int p_cube = 12*12*12;
-        const int p_cube_padded = p_cube;
-
-        // We could play with this
-        const int pts_per_thread = 4;  // 6*288 = 12*12*12
-        const int slab_size = 3;
-
-
-        //const int pts_per_thread = 12;  // 6*288 = 12*12*12
-        //const int slab_size = 1;
-
-        const int grid_size = *nelt;
-
-        ax_cuda_kernel_v3<p,p_sq,p_cube,p_cube_padded,pts_per_thread,slab_size,cta_size><<<grid_size,cta_size>>>(d_u, d_w, d_g, d_dxm1, d_dxtm1, *nelt);
-
-#else
-
         // 12x12x12 case
         const int p = 12;
         const int p_sq = 12*12;
@@ -3008,47 +692,14 @@ void axcuda_e(double *w, double *u, double *g, double *dxm1, double *dxtm1,
         // We could play with this
         const int grid_size = nelt;
 
-        /*
-        const int cta_size = 1728;
-        const int pts_per_thread = 1;  // 6*288 = 12*12*12
-        const int slab_size = 12;
-        */
-
-        /*
-        const int cta_size = 864;
-        const int pts_per_thread = 2;  // 6*288 = 12*12*12
-        const int slab_size = 6;
-        */
-
         // BEST CONFIG
         const int cta_size = 576;
         const int pts_per_thread = 3;  // 6*288 = 12*12*12
         const int slab_size = 4;
         const int num_ctas = 2;
-        /*
-        const int cta_size = 432;
-        const int pts_per_thread = 4;  // 6*288 = 12*12*12
-        const int slab_size = 3;
-        */
 
-
-        /*
-        const int cta_size = 288;
-        const int pts_per_thread = 6;  // 6*288 = 12*12*12
-        const int slab_size = 2;
-        */
-
-        //ax_cuda_kernel_v6<p,p_sq,p_cube,p_cube_padded,cta_size><<<grid_size,cta_size>>>(d_u, d_w, d_g, d_dxm1, d_dxtm1, *nelt);
-        //ax_cuda_kernel_v8<p,p_sq,p_cube,p_cube_padded,pts_per_thread,slab_size,cta_size,num_ctas><<<grid_size,cta_size>>>(d_u, d_w, d_g, d_dxm1, d_dxtm1, *nelt);
-        ax_cuda_kernel_v8_shared_D<p,p_sq,p_cube,p_cube_padded,pts_per_thread,slab_size,cta_size,num_ctas><<<grid_size,cta_size>>>(u, w, g, dxm1, dxtm1, nelt);
-
-
-        /*
-        const int cta_size = 1728;
-        ax_cuda_kernel_v9<p,p_cube,p_cube_padded,cta_size><<<grid_size,cta_size>>>(d_u, d_w, d_g, d_dxm1, d_dxtm1, *nelt);
-        */
-
-#endif
+        ax_cuda_kernel_v8_shared_D<p,p_sq,p_cube,p_cube_padded,pts_per_thread,slab_size,cta_size,num_ctas>
+          <<<grid_size,cta_size>>>(u, w, g, dxm1, dxtm1, nelt);
       }
 
       cudaCheckError();
@@ -3056,31 +707,97 @@ void axcuda_e(double *w, double *u, double *g, double *dxm1, double *dxtm1,
       cudaEventSynchronize(stop);
 
       cudaEventElapsedTime(&time, start, stop);
-      //printf ("Time for the kernel: %f ms\n", time);
-
-      /* copy w back to host */
-      //copyFrom(*nelt, nxyz, w);
-
       return;
 }
 
+int exec_mpi_recvs(double *buf, 
+                 const mpi_comm_wrapper* comm,
+                 const struct comm_data *c, MPI_Request* req)
+{
+  const uint *p, *pe, *size=c->size;
+  int send_size = 0;
 
-// 
+  for(p=c->p, pe=p+c->n ; p!=pe ; ++p) 
+  {
+    size_t len = *(size++);
+    MPI_Irecv(buf,len,MPI_DOUBLE,*p,*p,comm->mpi_comm,req++);
+    buf += len;
+    send_size += len;
+  }
+
+  return send_size;
+}
+
+int exec_mpi_sends(double *buf, 
+                 const mpi_comm_wrapper* comm,
+                 const struct comm_data *c, MPI_Request* req)
+{
+  const uint *p, *pe, *size=c->size;
+  int send_size=0;
+  for(p=c->p, pe=p+c->n; p!=pe; ++p) 
+  {
+    size_t len = *(size++);
+    MPI_Isend(buf, len, MPI_DOUBLE, *p, comm->id, comm->mpi_comm, req++);
+
+    buf += len;
+    send_size+=len;
+  }
+  return send_size;
+}
+
+void exec_mpi_wait(MPI_Request* req, int n)
+{
+  MPI_Waitall(n,req,MPI_STATUSES_IGNORE);
+}
+
+
+void exec_mpi_reduce_sum(double *val, double* output,
+                 const mpi_comm_wrapper* comm)
+{
+  MPI_Allreduce(val, output, 1, MPI_DOUBLE, MPI_SUM, comm->mpi_comm);
+}
+
 
 void gs_op_cuda(double* w, int dom, int op, int in_transpose)
 {
+  cudaCheckError();
   bool transpose = (in_transpose!=0);
 
-  // Reserve MPI buffer
+  const unsigned recv = 0^transpose, send = 1^transpose;
 
-  local_gather_cuda(w,w,gpu_dom.d_map_offsets[0^transpose],gpu_dom.d_map_indices_from[0^transpose],gpu_dom.d_map_indices_from_COO[0^transpose],gpu_dom.d_map_indices_to[0^transpose],gpu_dom.size_from[0], gpu_dom.size_to[0]);
+  local_gather_cuda(w,w,&(gpu_dom.local_map[0^transpose]));
 
-  //TODO: Do MPI communication here
+  cudaCheckError();
+  //local_init_cuda(w,gpu_dom.d_flagged_primaries,gpu_dom.flagged_primaries_size);
 
+  cudaCheckError();
+  if (gpu_dom.comm.np > 1)
+  {
+    // Post mpi receives
+    int recv_size = exec_mpi_recvs(gpu_dom.h_buffer, &(gpu_dom.comm), &(gpu_dom.comm_struct[recv]), gpu_dom.req);
 
-  // Init
+    // Fill send buffer
+    local_scatter_cuda(gpu_dom.d_buffer+recv_size, w, &(gpu_dom.comm_map[send]));
 
-  local_scatter_cuda(w,w,gpu_dom.d_map_offsets[1^transpose],gpu_dom.d_map_indices_from[1^transpose],gpu_dom.d_map_indices_from_COO[1^transpose], gpu_dom.d_map_indices_to[1^transpose],gpu_dom.size_from[1], gpu_dom.size_to[0]);
+    // Copy buffer from device to host
+    cudaMemcpy(gpu_dom.h_buffer+recv_size, gpu_dom.d_buffer+recv_size, 
+               gpu_dom.comm_map[send].size_to*sizeof(double), cudaMemcpyDeviceToHost);
+
+    // Send host buffer
+    exec_mpi_sends( gpu_dom.h_buffer+recv_size, &(gpu_dom.comm), &(gpu_dom.comm_struct[send]), 
+                    &(gpu_dom.req[gpu_dom.comm_struct[recv].n ]));
+
+    // Wait for mpi communication to terminate
+    exec_mpi_wait(gpu_dom.req, gpu_dom.comm_struct[0].n+gpu_dom.comm_struct[1].n);
+
+    // Copy buffer from host to device
+    cudaMemcpy(gpu_dom.d_buffer, gpu_dom.h_buffer, recv_size*sizeof(double), cudaMemcpyHostToDevice);
+
+    // Gather from buffer
+    local_gather_cuda(w, gpu_dom.d_buffer, &(gpu_dom.comm_map[recv]) );
+  }
+
+  local_scatter_cuda(w, w, &(gpu_dom.local_map[1^transpose]) );
 }
 
 void add2s2_cuda(double *a, double *b, double c1, int n)
@@ -3090,15 +807,28 @@ void add2s2_cuda(double *a, double *b, double c1, int n)
 }
 
 
+__global__ void add2s1_kernel(double *a, double *b, double c1, int n)
+{
+  int tid = blockIdx.x*blockDim.x + threadIdx.x;
+  if (threadIdx.x < n) {
+    a[tid] = c1*a[tid] + b[tid];
+  }
+}
+
 void add2s1_cuda(double *a, double *b, double c1, int n)
 {
 
  // TODO: should probably merge into single kernel
 
-  double one = 1.;
-  cublasDscal(cublas_handle, n, &c1, a, 1); 
-  cudaCheckError();
-  cublasDaxpy(cublas_handle, n, &one, b, 1, a, 1);
+//   double one = 1.;
+//   cublasDscal(cublas_handle, n, &c1, a, 1); 
+//   cudaCheckError();
+//   cublasDaxpy(cublas_handle, n, &one, b, 1, a, 1);
+//   cudaCheckError();
+
+  int block = 256;
+  int grid = (n + block - 1) / block;
+  add2s1_kernel<<<grid, block>>>(a, b, c1, n);
   cudaCheckError();
 }
 
@@ -3138,99 +868,13 @@ void glsc3_cuda_kernel(double* a, double* b, double* mult, double* result, int n
   }
 }
 
-
-template <int block_size>
-__global__ 
-void CalcSumOneBlock(double* temp, double* reduced_value, int shared_array_size)
-{
-  volatile __shared__ double s_data[block_size];
-  int tid = threadIdx.x;
-
-  if (blockIdx.x==0)
-  {
-    if (tid < shared_array_size)
-      s_data[tid] = temp[tid];
-    else
-      s_data[tid] = 0.;
-
-    __syncthreads();
-
-    if (block_size >= 1024) { if (tid < 512) { s_data[tid] = s_data[tid]+s_data[tid + 512]; } __syncthreads(); }
-    if (block_size >=  512) { if (tid < 256) { s_data[tid] = s_data[tid]+s_data[tid + 256]; } __syncthreads(); }
-    if (block_size >=  256) { if (tid < 128) { s_data[tid] = s_data[tid]+s_data[tid + 128]; } __syncthreads(); }
-    if (block_size >=  128) { if (tid <  64) { s_data[tid] = s_data[tid]+s_data[tid +  64]; } __syncthreads(); }
-    if (tid <  32) { s_data[tid] = s_data[tid]+s_data[tid +  32]; } 
-    if (tid <  16) { s_data[tid] = s_data[tid]+s_data[tid +  16]; } 
-    if (tid <   8) { s_data[tid] = s_data[tid]+s_data[tid +   8]; } 
-    if (tid <   4) { s_data[tid] = s_data[tid]+s_data[tid +   4]; } 
-    if (tid <   2) { s_data[tid] = s_data[tid]+s_data[tid +   2]; } 
-    if (tid <   1) { s_data[tid] = s_data[tid]+s_data[tid +   1]; } 
-
-    if (tid<1)
-    {
-      // Zero copy to host
-      *(reduced_value)= s_data[0];
-    }
-  }
-}
-
-
-template < int cta_size >
-__global__ 
-void glsc3_cuda_kernel_v2(double* a, double* b, double* mult, double *result, int n)
-{
-  __shared__ volatile double s_data[cta_size];
-  int tid = blockIdx.x*blockDim.x+threadIdx.x;
-  double temp = 0.;
-  while (tid < n)
-  {
-    temp += a[tid]*b[tid]*mult[tid];
-    tid += gridDim.x*blockDim.x;
-  }
-
-  s_data[tid] = temp;
-
-  __syncthreads();
-
-  // Do shared memory reduction, TODO: use CUB
-  if (cta_size >= 1024) { 
-    if (tid < 512) s_data[tid]   = s_data[tid] + s_data[tid + 512] ; 
-    __syncthreads();  
-    }
-
-  if (cta_size >=  512) { 
-    if (tid < 256) s_data[tid] = s_data[tid] + s_data[tid + 256] ;
-    __syncthreads(); 
-  }
-
-  if (cta_size >=  256) { 
-    if (tid < 128) s_data[tid] = s_data[tid] + s_data[tid + 128] ; 
-    __syncthreads(); 
-  }
-
-  if (cta_size >=  128) { 
-    if (tid <  64) s_data[tid] = s_data[tid] + s_data[tid +  64] ; 
-    __syncthreads(); 
-  }
-
-  if (tid <  32) s_data[tid] = s_data[tid] + s_data[tid +  32] ; 
-  if (tid <  16) s_data[tid] = s_data[tid] + s_data[tid +  16] ;  
-  if (tid <   8) s_data[tid] = s_data[tid] + s_data[tid +   8] ;  
-  if (tid <   4) s_data[tid] = s_data[tid] + s_data[tid +   4] ;  
-  if (tid <   2) s_data[tid] = s_data[tid] + s_data[tid +   2] ;  
-  if (tid <   1) s_data[tid] = s_data[tid] + s_data[tid +   1] ;  
-
-  if (tid==0) 
-    result[blockIdx.x] = s_data[tid];
-
-}
-
 double glsc3_cuda(double *a, double* b, double* mult,  int n)
 {
   cudaCheckError();
 
   double glsc3;
-  // TODO: This could be made faster by having a single kernel followed by reduction across block, instead of writing to global memory
+  // TODO: This could be made faster by having a single kernel followed by reduction across block, 
+  // instead of writing to global memory
   int cta_size = 128;
   int grid_size=min(4096,( (n+cta_size-1)/cta_size));
 
@@ -3238,10 +882,15 @@ double glsc3_cuda(double *a, double* b, double* mult,  int n)
 
   thrust::device_ptr<double> beg(gpu_dom.d_temp);
   glsc3 = thrust::reduce(beg,beg+n);
-  return glsc3;
+  
+ // printf("before reduce %e\n",glsc3);
+
+  exec_mpi_reduce_sum(&glsc3,&glsc3,&(gpu_dom.comm));
+
+  //printf("after educe %e\n",glsc3);
 
   cudaCheckError();
-
+  return glsc3;
 }
 
 void solveM_cuda(double *z, double* r, int n)
@@ -3249,7 +898,9 @@ void solveM_cuda(double *z, double* r, int n)
   copy_cuda(z,r,n);
 }
 
-void axcuda(double* w, double* u, double *g, double *dxm1, double* dxtm1, int nx1, int ny1, int nz1, int nelt, int ldim, int nid)
+void axcuda(double* w, double* u, double *g, double *dxm1, double* dxtm1, 
+            int nx1, int ny1, int nz1, int nelt, int ldim, int nid, 
+            double *flop_a)
 {
 
   axcuda_e(w,u,g,dxm1,dxtm1,nx1,ny1,nz1,nelt,ldim);
@@ -3260,6 +911,9 @@ void axcuda(double* w, double* u, double *g, double *dxm1, double* dxtm1, int nx
   int n = nx1*ny1*nz1*nelt;
   add2s2_cuda(w,u,.1,n);
   mask_cuda(w,nid);
+
+  int nxyz = nx1*ny1*nz1;
+  *flop_a += (19*nxyz+12*nx1*nxyz)*nelt;
 }
 
 
@@ -3267,15 +921,58 @@ extern "C"
 {
   void gs_setup_cuda(const uint* map_local_0, const uint* map_local_1, const uint* flagged_primaries)
   {
-
     // Initialize data required for gather-scatter operation
-    fill_gpu_maps(&(gpu_dom.size_from[0]), &(gpu_dom.size_to[0]), &(gpu_dom.d_map_offsets[0]), &(gpu_dom.d_map_indices_from[0]), &(gpu_dom.d_map_indices_from_COO[0]), &(gpu_dom.d_map_indices_to[0]), map_local_0);
-    fill_gpu_maps(&(gpu_dom.size_from[1]), &(gpu_dom.size_to[1]), &(gpu_dom.d_map_offsets[1]), &(gpu_dom.d_map_indices_from[1]), &(gpu_dom.d_map_indices_from_COO[1]), &(gpu_dom.d_map_indices_to[1]), map_local_1);
+    fill_gpu_maps( &(gpu_dom.local_map[0]), map_local_0);
+    fill_gpu_maps( &(gpu_dom.local_map[1]), map_local_1);
 
-    fill_flagged_primaries_map(gpu_dom.d_flagged_primaries,flagged_primaries);
-
+    fill_flagged_primaries_map(&(gpu_dom.d_flagged_primaries),flagged_primaries);
   }
 
+  void gs_comm_setup_cuda(const uint comm_0_n, const uint* comm_0_p, const uint* comm_0_size, const uint comm_0_total,
+                          const uint comm_1_n, const uint* comm_1_p, const uint* comm_1_size, const uint comm_1_total,
+                          const uint* map_comm_0, const uint* map_comm_1,
+                          uint buffer_size,
+                          const MPI_Comm* mpi_comm,
+                          int comm_id,
+                          int comm_np)
+  {
+    // Duplicate the MPI communicator
+    MPI_Comm_dup( (*mpi_comm), &(gpu_dom.comm.mpi_comm) );
+    gpu_dom.comm.id = comm_id;
+    gpu_dom.comm.np = comm_np;
+
+    if (gpu_dom.comm.np > 1)
+    {
+      // Initialize the communication structure
+      init_comm_struct( &(gpu_dom.comm_struct[0]), comm_0_n, comm_0_p, comm_0_size, comm_0_total);
+      init_comm_struct( &(gpu_dom.comm_struct[1]), comm_1_n, comm_1_p, comm_1_size, comm_1_total);
+      cudaCheckError();
+
+      // Create the MPI gather-scatter maps
+      fill_gpu_maps( &(gpu_dom.comm_map[0]), map_comm_0);
+      fill_gpu_maps( &(gpu_dom.comm_map[1]), map_comm_1);
+      cudaCheckError();
+
+      // Allocate the send and receive buffers on host and device
+      gpu_dom.buffer_size = buffer_size;
+      gpu_dom.h_buffer= (double*) malloc( (buffer_size)*sizeof(double));
+      cudaMalloc((double **) &(gpu_dom.d_buffer), buffer_size*sizeof(double));
+      cudaCheckError();
+
+      // Create the array of MPI requests
+      gpu_dom.req = (MPI_Request*) malloc( (comm_0_n+comm_1_n)*sizeof(MPI_Request));
+      cudaCheckError();
+    }
+  }
+
+  void cg_cuda_set_device_(int* nid)
+  {
+    int gpu_count;
+    cudaGetDeviceCount(&gpu_count);
+    int device_id = (*nid)%gpu_count;
+    cudaSetDevice(device_id);
+    printf("rank %d selecting gpu %d\n",*nid,device_id);
+  }
 
   void cg_cuda_init_(double* x, double* f, double* g, double* c, double* r, double* w, double* p, double* z, int* nx1, int* ny1, int* nz1, int* nelt, int* ldim, double* dxm1, double* dxtm1, int* niter, double* flop_cg, const int *gsh_handle, int* nid)
   {
@@ -3300,7 +997,6 @@ extern "C"
     cudaCheckError();
 
     // malloc GPU memory for u, w, ur, us, ut, g, dxm1, dxtm1 
-    //cudaMalloc((void **)&gpu_dom.d_u, gpu_dom.nelt*nxyz*sizeof(double));
     cudaMalloc((void **)&gpu_dom.d_w, gpu_dom.nelt*nxyz*sizeof(double));
     cudaMalloc((void **)&gpu_dom.d_f, gpu_dom.nelt*nxyz*sizeof(double));
     cudaMalloc((void **)&gpu_dom.d_c, gpu_dom.nelt*nxyz*sizeof(double));
@@ -3350,13 +1046,8 @@ extern "C"
   }
 
 
-  void cg_cuda_(double* r, int* copy_to_cpu)
+  void cg_cuda_(double* r, int* copy_to_cpu, double *flop_cg, double *flop_a)
   {
-    cudaEvent_t timer_start, timer_stop;
-    cudaEventCreate(&timer_start);
-    cudaEventCreate(&timer_stop);
-    cudaEventRecord( timer_start );
-
     int n = gpu_dom.nx1 * gpu_dom.ny1 * gpu_dom.nz1 * gpu_dom.nelt;
     double pap = 0.0;
 
@@ -3381,7 +1072,8 @@ extern "C"
     double rnorm = sqrt(glsc3_cuda(gpu_dom.d_r, gpu_dom.d_c, gpu_dom.d_r, n));
       
     int iter = 0;
-    printf("cg: %d %g\n",iter,rnorm);
+    if (gpu_dom.nid==0) 
+      printf("cg:%4d %11.4e\n",iter,rnorm);
 
     int miter = gpu_dom.niter;
     double alpha, beta;
@@ -3402,7 +1094,9 @@ extern "C"
 #endif
        add2s1_cuda(gpu_dom.d_p, gpu_dom.d_z, beta, n);
 
-       axcuda(gpu_dom.d_w, gpu_dom.d_p, gpu_dom.d_g, gpu_dom.d_dxm1, gpu_dom.d_dxtm1, gpu_dom.nx1, gpu_dom.ny1, gpu_dom.nz1, gpu_dom.nelt, gpu_dom.ldim, gpu_dom.nid);
+       axcuda(gpu_dom.d_w, gpu_dom.d_p, gpu_dom.d_g, gpu_dom.d_dxm1, gpu_dom.d_dxtm1, 
+              gpu_dom.nx1, gpu_dom.ny1, gpu_dom.nz1, gpu_dom.nelt, gpu_dom.ldim, gpu_dom.nid,
+              flop_a);
 
        pap = glsc3_cuda(gpu_dom.d_w, gpu_dom.d_c, gpu_dom.d_p, n);
 #ifdef DEBUG
@@ -3419,18 +1113,14 @@ extern "C"
        rnorm = sqrt(rtr);
     }
 
+    *flop_cg += miter*15.0*n + 3.0*n;
+
     if (gpu_dom.nid==0) 
-      printf("cg: %d %12.8g %12.8g %12.8g %12.8g\n",iter,rnorm,alpha,beta,pap);
+      printf("cg:%4d %11.4e %11.4e %11.4e %11.4e\n",iter,rnorm,alpha,beta,pap);
 
     if ((*copy_to_cpu)==1)
       cudaMemcpy(r, gpu_dom.d_r, n*sizeof(double), cudaMemcpyDeviceToHost);
 
-    float elapsed_time;
-    cudaEventRecord( timer_stop );
-    cudaEventSynchronize( timer_stop);
-    cudaEventElapsedTime( &elapsed_time, timer_start, timer_stop );
-    elapsed_time*=1.e-3f;
-    printf("GPU Elapsed Time        =  %8.4e seconds\n",elapsed_time);
   }
 
   void cg_cuda_free_() 
@@ -3439,15 +1129,25 @@ extern "C"
 
     cudaCheckError();
 
-    cudaFree(gpu_dom.d_map_offsets[0]);
-    cudaFree(gpu_dom.d_map_indices_from[0]);
-    cudaFree(gpu_dom.d_map_indices_from_COO[0]);
-    cudaFree(gpu_dom.d_map_indices_to[0]);
+    cudaFree(gpu_dom.local_map[0].d_offsets);
+    cudaFree(gpu_dom.local_map[0].d_indices_from);
+    cudaFree(gpu_dom.local_map[0].d_indices_from_COO);
+    cudaFree(gpu_dom.local_map[0].d_indices_to);
 
-    cudaFree(gpu_dom.d_map_offsets[1]);
-    cudaFree(gpu_dom.d_map_indices_from[1]);
-    cudaFree(gpu_dom.d_map_indices_from_COO[1]);
-    cudaFree(gpu_dom.d_map_indices_to[1]);
+    cudaFree(gpu_dom.local_map[1].d_offsets);
+    cudaFree(gpu_dom.local_map[1].d_indices_from);
+    cudaFree(gpu_dom.local_map[1].d_indices_from_COO);
+    cudaFree(gpu_dom.local_map[1].d_indices_to);
+
+    cudaFree(gpu_dom.comm_map[0].d_offsets);
+    cudaFree(gpu_dom.comm_map[0].d_indices_from);
+    cudaFree(gpu_dom.comm_map[0].d_indices_from_COO);
+    cudaFree(gpu_dom.comm_map[0].d_indices_to);
+
+    cudaFree(gpu_dom.comm_map[1].d_offsets);
+    cudaFree(gpu_dom.comm_map[1].d_indices_from);
+    cudaFree(gpu_dom.comm_map[1].d_indices_from_COO);
+    cudaFree(gpu_dom.comm_map[1].d_indices_to);
 
     cudaFree(gpu_dom.d_w);
     cudaFree(gpu_dom.d_p);

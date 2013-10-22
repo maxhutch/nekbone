@@ -560,6 +560,17 @@ static void pw_setup(struct gs_remote *r, struct gs_topology *top,
   r->data = pwd;
   r->exec = (exec_fun*)&pw_exec;
   r->fin = (fin_fun*)&pw_free;
+
+#ifdef CUDA
+  gs_comm_setup_cuda(pwd->comm[0].n, pwd->comm[0].p, pwd->comm[0].size, pwd->comm[0].total, 
+                     pwd->comm[1].n, pwd->comm[1].p, pwd->comm[1].size, pwd->comm[1].total,
+                     pwd->map[0], pwd->map[1], 
+                     pwd->buffer_size,
+                     &(comm->c),
+                     comm->id,
+                     comm->np);
+#endif
+
 }
 
 /*------------------------------------------------------------------------------
