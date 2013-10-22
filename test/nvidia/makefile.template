@@ -1,27 +1,26 @@
-### makefile automatically created by makenek 10/02/2013 12:57:33 ###
 BINNAME=nekbone
-CASENAME:=
-CASEDIR:=/home/pcastonguay/Perforce_workspace_sw/sw/devrel/internal/miniapps/nekbone/nekbone-2.2.x.cuda/build
-S:=/home/pcastonguay/Perforce_workspace_sw/sw/devrel/internal/miniapps/nekbone/nekbone-2.2.x.cuda/src/src
+CASENAME=
+CASEDIR=
+S=
 J:=$S/jl
 OPT_INCDIR:=./
 OBJDIR=obj
-IFMPI:=true
-F77:=mpif77
-CC:=nvcc -arch=sm_35 --ptxas-options=-v
-P:=-fcray-pointer -fdefault-real-8 -x f77-cpp-input
+IFMPI= 
+F77=
+CC=
+P=
 PPPO=
-PPS= PTRSIZE8 MPI LONGINT8 UNDERSCORE GLOBAL_LONG_LONG
-G:=
+PPS=
+G=
 OPT_FLAGS_STD=
-USR:=
-USR_LFLAGS:=-L/usr/local/cuda-5.5/lib64 -lcudart -lcublas
+USR=
+USR_LFLAGS=
 USR_IFLAGS=
 ################################################################################
 
 lFLAGS = $(USR_LFLAGS)
 #iFLAGS = $(USR_IFLAGS) 
-iFLAGS=-I/usr/lib/openmpi/include/ -I/usr/local/cuda5.5/include
+iFLAGS=-I/opt/openmpi/include/ -I/opt/cuda/5.5/include
 
 PPS_F = $(patsubst %,$(PPPO)-D%,$(PPS))
 PPS_C = $(patsubst %,-D%,$(PPS))
@@ -32,7 +31,7 @@ speclib.o
 
 ################################################################################
 # MXM 
-MXM=mxm_std.o blas.o
+MXM = mxm_std.o
 
 # JL Routines ###################################################################
 JO  = jl_
@@ -65,10 +64,10 @@ CUDACG = $(patsubst %,$(OBJDIR)/%,cg-cuda.o cgcuda.o math.o)
 
 ##############################################################################
 
-L0=$(G) -O0
-L2=$(G) -O2
-L3=$(G) -O3
-L4=$(L3)
+L0 = $(G) -O0
+L2 = $(G) $(OPT_FLAGS_STD)
+L3 = $(G) $(OPT_FLAGS_STD)
+L4 = $(L3)
 
 FL0   = $(L0) $(P) $(PPS_F) -I$(CASEDIR) -I$S -I$(OPT_INCDIR)	
 FL2i4 = $(L0)      $(PPS_F) -I$(CASEDIR) -I$S -I$(OPT_INCDIR)	

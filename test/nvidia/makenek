@@ -3,7 +3,7 @@
 # (c) 2008,2009,2010 UCHICAGO ARGONNE, LLC
 
 # source path 
-SOURCE_ROOT="../src/src" 
+SOURCE_ROOT="..//src" 
 
 # Fortran compiler
 F77="mpif77"
@@ -28,8 +28,8 @@ IFMPI="true"
 #USR="foo.o"
 
 # linking flags
-USR_LFLAGS="-L/usr/local/cuda-5.5/lib64 -lcudart -lcublas"
-USR_IFLAGS="-I/usr/lib/openmpi/include/ -I/usr/local/cuda5.5/include"
+USR_LFLAGS="-L/opt/cuda/5.5/lib64 -lcudart -lcublas"
+USR_IFLAGS="-I/opt/openmpi/include/ -I/opt/cuda/5.5/include"
 
 # generic compiler flags
 #G="-g"
