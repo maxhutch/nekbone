@@ -1,3 +1,5 @@
+#undef USE_CUDA
+
 c-----------------------------------------------------------------------
       subroutine cg(x,f,g,c,r,w,p,z,n,niter,flop_cg_l)
       include 'SIZE'
@@ -33,12 +35,12 @@ c     set machine tolerances
       eps = 1.e-20
       if (one+eps .eq. one) eps = 1.e-14
       if (one+eps .eq. one) eps = 1.e-7
-
       rtz1=1.0
 
       call rzero(x,n)
       call copy (r,f,n)
-      call maskit (r,cmask,nx1,ny1,nz1) ! Zero out Dirichlet conditions
+c      call maskit (r,cmask,nx1,ny1,nz1) ! Zero out Dirichlet conditions
+      call masko (r) ! Zero out Dirichlet conditions
 
       rnorm = sqrt(glsc3(r,c,r,n))
       iter = 0
@@ -71,6 +73,7 @@ c     call tester(z,r,n)
          if (iter.eq.1) rlim2 = rtr*eps**2
          if (iter.eq.1) rtr0  = rtr
          rnorm = sqrt(rtr)
+c         write(6,*) "RNORM: ", rnorm
 c        if (nid.eq.0.and.mod(iter,100).eq.0) 
 c    $      write(6,6) iter,rnorm,alpha,beta,pap
     6    format('cg:',i4,1p4e12.4)
@@ -96,7 +99,8 @@ c-----------------------------------------------------------------------
       real z(n),r(n)
 
       nn = n
-      call h1mg_solve(z,r,nn)
+      call copy(z,r,n)
+c      call h1mg_solve(z,r,nn)
 
       return
       end
@@ -125,7 +129,8 @@ c-----------------------------------------------------------------------
       call dssum(w)         ! Gather-scatter operation  ! w   = QQ  w
                                                            !            L
       call add2s2(w,u,.1,n)   !2n
-      call maskit(w,cmask,nx1,ny1,nz1)  ! Zero out Dirichlet conditions
+c      call maskit(w,cmask,nx1,ny1,nz1)  ! Zero out Dirichlet conditions
+      call masko(w)   ! Zero out Dirichlet conditions
 
       nxyz=nx1*ny1*nz1
       flop_a = flop_a + (19*nxyz+12*nx1*nxyz)*nelt

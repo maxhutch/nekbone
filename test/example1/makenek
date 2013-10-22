@@ -3,32 +3,24 @@
 # (c) 2008,2009,2010 UCHICAGO ARGONNE, LLC
 
 # source path 
-SOURCE_ROOT="/data/nekbone/src/" 
+SOURCE_ROOT="$HOME/proj/nekbone/src/cuda-nekbone-2.1.2/src" 
 
 # Fortran compiler
-F77="mpif77"
+F77="gfortran"
 
 # C compiler
-CC="mpicc"
-
-# CUDA Compiler
-#NVCC="/opt/cuda/5.5/bin/nvcc -gencode=arch=compute_10,code=sm_10 -gencode=arch=compute_20,code=sm_20 -gencode=arch=compute_30,code=sm_30 -gencode=arch=compute_35,code=sm_35 -gencode=arch=compute_35,code=compute_35"
-NVCC="nvcc -gencode=arch=compute_35,code=sm_35 --ptxas-options=-v -I/opt/openmpi/include "
+CC="nvcc"
 
 # pre-processor symbol list 
 # (set PPLIST=? to get a list of available symbols)
-# NEKCOMM, NEKDLAY, BG, MGRID
-#PPLIST="?"
+#PPLIST="?" 
 
 
 # OPTIONAL SETTINGS
 # -----------------
 
 # enable MPI (default true)
-#IFMPI="false"
-
-# enable CUDA (default false)
-IFCUDA="true"
+IFMPI="false"
 
 # auxilliary files to compile
 # NOTE: source files have to located in the same directory as makenek
@@ -36,10 +28,10 @@ IFCUDA="true"
 #USR="foo.o"
 
 # linking flags
-USR_LFLAGS="-lstdc++ -L/opt/cuda/5.5/lib64 -lcuda -lcudart -lcublas /data/magma/lib/libmagma.a"
+USR_LFLAGS="-L/usr/local/cuda/lib64 -lcudart"
 
 # generic compiler flags
-G="-g -I/data/magma/include -DHAVE_CUBLAS"
+#G="-g"
 
 # optimization flags
 #OPT_FLAGS_STD=""

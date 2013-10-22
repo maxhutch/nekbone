@@ -20,7 +20,7 @@ G=
 OPT_FLAGS_STD=
 USR=
 USR_LFLAGS=
-
+USR_IFLAGS=
 ################################################################################
 
 lFLAGS = $(USR_LFLAGS)
@@ -55,8 +55,9 @@ MXM = mxm_std.o
 ################################################################################
 # CUDA
 ifeq ($(IFCUDA), true)
-  CUDA = cuda_main.o cuda_ax.o
+  CUDA = cuda_main.o cuda_ax.o cgcuda.o 
   PPS_F += -DUSE_CUDA
+  PPS_C += -DUSE_CUDA
 else
   CUDA = 
 endif
@@ -88,6 +89,8 @@ TMP0c = $(JLCORE)
 NOBJS_C0 = $(patsubst %,$(OBJDIR)/%,$(TMP0c))
 
 NOBJS0_bone = $(NOBJS_Fbon) $(NOBJS_C0)
+ORIG = $(patsubst %,$(OBJDIR)/%,cg.o math.o)
+#CUDACG = $(patsubst %,$(OBJDIR)/%,cg-cuda.o cgcuda.o math.o)
 ##############################################################################
 
 L0 = $(G) -O0
@@ -108,6 +111,9 @@ cFL4   = $(L4) $(PPS_C)
 ################################################################################
 all : nekbone
 
+##############################################################################
+#all : nekbone-cgcuda
+
 objdir: 
 	@mkdir $(OBJDIR) 2>/dev/null; cat /dev/null 
 
@@ -118,6 +124,22 @@ nekbone: 	objdir $(NOBJS0_bone)
 	echo "#                  Compilation successful!                  #"; \
 	echo "#############################################################"; \
         size ${BINNAME}; \
+        echo ""; \
+	else \
+	echo -e "\033[1;31;38m" "ERROR: Compilation failed!"; \
+	echo -e "\033[0m"; \
+	fi
+ifeq ($(IFMPI),false) 
+	@rm -rf $S/mpif.h
+endif
+
+nekbone-cgcuda: 	objdir $(NOBJS0) $(CUDACG) 
+	$(F77) -o $@ $G $(NOBJS0) $(CUDACG) $(lFLAGS)
+	@if test -f $@; then \
+	echo "#############################################################"; \
+	echo "#                  Compilation successful!                  #"; \
+	echo "#############################################################"; \
+        size $@; \
         echo ""; \
 	else \
 	echo -e "\033[1;31;38m" "ERROR: Compilation failed!"; \
@@ -151,7 +173,8 @@ $(OBJDIR)/delay.o	:$S/delay.f;			$(F77) -c $(FL2) $< -o $@
 $(OBJDIR)/delay_dum.o	:$S/delay_dum.f;		$(F77) -c $(FL2) $< -o $@
 # CUDA      ############################################################################
 $(OBJDIR)/cuda_main.o	:$S/cuda_main.cu;		$(NVCC) -c $(G) $< -o $@
-$(OBJDIR)/cuda_ax.o	:$S/cuda_ax.cu;		$(NVCC) -c $(G) $< -o $@
+$(OBJDIR)/cuda_ax.o	:$S/cuda_ax.cu;			$(NVCC) -c $(G) $< -o $@
+$(OBJDIR)/cgcuda.o      :$S/cgcuda.cu;	  		$(NVCC) -c $(cFL2) $(JL) $< -o $@
 # MXM       ############################################################################
 $(OBJDIR)/mxm_wrapper.o	  :$S/mxm_wrapper.f;		$(F77) -c $(FL2) $< -o $@ 
 $(OBJDIR)/mxm_std.o	  :$S/mxm_std.f;		$(F77) -c $(FL4) $< -o $@
@@ -173,4 +196,5 @@ $(OBJDIR)/$(JO)sarray_transfer.o :$(J)/sarray_transfer.c; $(CC) -c $(cFL2) $(JL)
 $(OBJDIR)/$(JO)fcrystal.o        :$(J)/fcrystal.c;        $(CC) -c $(cFL2) $(JL) $< -o $@
 $(OBJDIR)/$(JO)sleep.o		:$(J)/sleep.c;		$(CC) -c $(cFL2) $(JL) $< -o $@
 $(OBJDIR)/$(JO)gs.o              :$(J)/gs.c;              $(CC) -c $(cFL2) $(JL) $< -o $@
+$(OBJDIR)/$(JO)gs_cuda.o         :$(J)/gs_cuda.cu;        $(CC) -c $(cFL2) $(JL) $< -o $@
 $(OBJDIR)/$(JO)gs_local.o        :$(J)/gs_local.c;        $(CC) -c $(cFL2) $(JL) $< -o $@

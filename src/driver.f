@@ -11,9 +11,10 @@ c-----------------------------------------------------------------------
       parameter (lt=lxyz*lelt)
 
       real x(lt),f(lt),r(lt),w(lt),p(lt),z(lt),c(lt)
+      real r_gpu(lt)
       real g(6,lt)
       real mfloplist(1024), avmflop
-      integer icount  
+      integer icount
 
       logical ifbrick
       integer iel0,ielN,ielD   ! element range per proc.
@@ -21,13 +22,14 @@ c-----------------------------------------------------------------------
       integer npx,npy,npz      ! processor decomp
       integer mx ,my ,mz       ! element decomp
 
+      real*8 time_beg
+      real*8 time_end
+
 #ifdef USE_CUDA
       call setup_cuda()
 #endif
 
       call iniproc(mpi_comm_world)    ! has nekmpi common block
-      call init_delay
-
       call read_param(ifbrick,iel0,ielN,ielD,nx0,nxN,nxD,
      $                               npx,npy,npz,mx,my,mz)
 
@@ -54,17 +56,61 @@ c     SET UP and RUN NEKBONE
 
            call set_f(f,c,n)
 
-           if(nid.eq.0) write(6,*)
+           ! Initialized the GPU arrays
+           call cg_cuda_init(x,f,g,c,r,w,p,z,nx1,ny1,nz1,nelt,ldim,
+     &                       dxm1,dxtm1,niter,flop_cg,gsh,nid)
+
+           !Run cg iterations on device and copy back to host r vector
+           call cg_cuda(r,1)
+
+           ! Copy gpu results for future comparison
+           do it=1,n
+             r_gpu(it) = r(it)
+           end do
+
+           !Run cg iterations on host
            call cg(x,f,g,c,r,w,p,z,n,niter,flop_cg)
 
+           ! Compare the CPU and GPU solutions
+           do it=1,n
+             if (abs(r_gpu(it) - r(it)) .ge. 1e-14) then
+               write(6,*) "CPU and GPU results don't match, i=", 
+     +                    it, r_gpu(it), r(it)
+               exit
+             endif 
+           end do
+           write(6,*) "Max CPU GPU diff= ", maxval(r_gpu-r)
+
+           ! Rerun with timing, without copying back to host
            call nekgsync()
 
            call set_timer_flop_cnt(0)
+c          call summary_start()
+
+           write(6,*) '---------------------------------------------'
+           write(6,*) 'GPU RESULTS'
+           write(6,*) '---------------------------------------------'
+           !Run cg iterations on device
+           call cg_cuda(r,0)
+
+           write(6,*) '---------------------------------------------'
+           write(6,*) 'CPU RESULTS'
+           write(6,*) '---------------------------------------------'
+
+           ! Run same computation on host
+           call set_timer_flop_cnt(0)
+           time_beg = dnekclock()
            call cg(x,f,g,c,r,w,p,z,n,niter,flop_cg)
+           time_end = dnekclock()
+           write(6,*) "CPU time: ",time_beg-time_end
+           write(6,*) "---------------------------------------------"
+
            call set_timer_flop_cnt(1)
 
+c          call summary_stop()
            call gs_free(gsh)
-           
+
+           call cg_cuda_free()
            icount = icount + 1
            mfloplist(icount) = mflops*np
          enddo
@@ -89,7 +135,7 @@ c     call xfer(np,cr_h)
 
 #ifdef USE_CUDA
       call teardown_cuda()
-#endif USE_CUDA
+#endif 
 
       call exitt0
 

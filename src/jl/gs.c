@@ -19,14 +19,21 @@
 #include "sarray_sort.h"
 #include "sarray_transfer.h"
 
+
+#ifdef USE_CUDA
+#include "../cgcuda.h"
+//#include "cuda_runtime.h"
+//#include "gs_cuda.h"
+//#include "gs_cuda_interface.h"
+//#include "cuda_util.h"
+#endif 
+
 #define gs         PREFIXED_NAME(gs       )
 #define gs_vec     PREFIXED_NAME(gs_vec   )
 #define gs_many    PREFIXED_NAME(gs_many  )
 #define gs_setup   PREFIXED_NAME(gs_setup )
 #define gs_free    PREFIXED_NAME(gs_free  )
 #define gs_unique  PREFIXED_NAME(gs_unique)
-
-
 
 GS_DEFINE_DOM_SIZES()
 
@@ -1167,6 +1174,10 @@ void fgs_setup(sint *handle, const slong id[], const sint *n,
   comm_init_check(&gsh->comm,*comm,*np);
   gs_setup_aux(gsh,id,*n,0,gs_auto,1);
   *handle = fgs_n++;
+#ifdef USE_CUDA
+  printf("Setting up cuda gs\n");
+  gs_setup_cuda(gsh->map_local[0], gsh->map_local[1], gsh->flagged_primaries);
+#endif
 }
 
 static void fgs_check_handle(sint handle, const char *func, unsigned line)

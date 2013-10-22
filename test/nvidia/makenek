@@ -39,7 +39,7 @@ IFCUDA="true"
 USR_LFLAGS="-lstdc++ -L/opt/cuda/5.5/lib64 -lcuda -lcudart -lcublas /data/magma/lib/libmagma.a"
 
 # generic compiler flags
-G="-g -I/data/magma/include -DHAVE_CUBLAS"
+G="-g -I/data/magma/include -I. -I.. -DHAVE_CUBLAS"
 
 # optimization flags
 #OPT_FLAGS_STD=""

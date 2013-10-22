@@ -129,6 +129,10 @@ typedef enum { gs_pairwise, gs_crystal_router, gs_all_reduce,
 
 void gs(void *u, gs_dom dom, gs_op op, unsigned transpose,
         struct gs_data *gsh, buffer *buf);
+
+void gs_cuda(void *u, gs_dom dom, gs_op op, unsigned transpose,
+             struct gs_data *gsh, buffer *buf);
+
 void gs_vec(void *u, unsigned vn, gs_dom dom, gs_op op,
             unsigned transpose, struct gs_data *gsh, buffer *buf);
 void gs_many(void *const*u, unsigned vn, gs_dom dom, gs_op op,
