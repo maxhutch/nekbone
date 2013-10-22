@@ -5,15 +5,6 @@
 /** \mainpage notitle  
  * \n\n\n
  * 
- * We will incorporate the use of GPUs in VASP to replace existing
- * FFTs and certain linear algebra algorithms in the "subspace diagonalization" portion
- * of code. These parts of VASP constitute computational bottlenecks for ab initio
- * simulations currently being performed in the DoD. It is hoped that the application
- * of GPUs will offer a significant increase in speed for one of the most heavily used
- * scientific codes in the DoD. This work is part of a suite of proposals that will enhance
- * VASP in several respects and profile the new code on recently purchased DoD
- * machines. The resulting improvements will be available to all DoD license holders with
- * DSRC accounts.
  */
 
 #include <stdio.h>
