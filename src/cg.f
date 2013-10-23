@@ -1,7 +1,5 @@
-#undef USE_CUDA
-
 c-----------------------------------------------------------------------
-      subroutine cg(x,f,g,c,r,w,p,z,n,niter,flop_cg_l)
+      subroutine cg(x,f,g,c,r,w,p,z,n,niter,flop_cg_l, use_cuda)
       include 'SIZE'
       include 'TOTAL'
 
@@ -26,6 +24,8 @@ c
 
       real x(n),f(n),r(n),w(n),p(n),z(n),g(1),c(n)
 
+      logical use_cuda
+
       character*1 ans
 
       pap = 0.0
@@ -45,8 +45,11 @@ c     set machine tolerances
       iter = 0
       if (nid.eq.0)  write(6,6) iter,rnorm
 
+      write(*,*) use_cuda
 #ifdef USE_CUDA
-      call setup_cg_cuda(w, p, g, dxm1, dxtm1, nx1-1, nelt)
+      if (use_cuda) then
+        call setup_cg_cuda(w, p, g, dxm1, dxtm1, nx1-1, nelt)
+      endif
 #endif
 
       miter = niter
@@ -60,7 +63,7 @@ c     call tester(z,r,n)
          if (iter.eq.1) beta=0.0
          call add2s1(p,z,beta,n)                                         ! 2n
 
-         call ax(w,p,g,ur,us,ut,wk,n)                                    ! flopa
+         call ax(w,p,g,ur,us,ut,wk,n, use_cuda)                          ! flopa
          pap=glsc3(w,c,p,n)                                              ! 3n
 
          alpha=rtz1/pap
@@ -83,7 +86,9 @@ c        if (rtr.le.rlim2) goto 1001
  1001 continue
 
 #ifdef USE_CUDA
-      call teardown_cg_cuda(w,p,g,nx1-1,nelt)
+      if (use_cuda) then
+        call teardown_cg_cuda(w,p,g,nx1-1,nelt)
+      endif
 #endif
 
       if (nid.eq.0) write(6,6) iter,rnorm,alpha,beta,pap
@@ -103,13 +108,14 @@ c-----------------------------------------------------------------------
       return
       end
 c-----------------------------------------------------------------------
-      subroutine ax(w,u,gxyz,ur,us,ut,wk,n) ! Matrix-vector product: w=A*u
+      subroutine ax(w,u,gxyz,ur,us,ut,wk,n, use_cuda) ! Matrix-vector product: w=A*u
 
       include 'SIZE'
       include 'TOTAL'
 
       real w(nx1*ny1*nz1,nelt),u(nx1*ny1*nz1,nelt)
       real gxyz(2*ldim,nx1*ny1*nz1,nelt)
+      logical use_cuda
 
       parameter (lt=lx1*ly1*lz1*lelt)
       real ur(lt),us(lt),ut(lt),wk(lt)
@@ -117,12 +123,16 @@ c-----------------------------------------------------------------------
 
       integer e
 #ifdef USE_CUDA
-      call ax_e_cuda(w, u,dxm1,dxtm1,gxyz,nx1-1,nelt)
-#else
+      if (use_cuda) then
+        call ax_e_cuda(w, u,dxm1,dxtm1,gxyz,nx1-1,nelt)
+      else
+#endif
       do e=1,nelt                                ! ~
          call ax_e( w(1,e),u(1,e),gxyz(1,1,e)    ! w   = A  u
      $                             ,ur,us,ut,wk) !  L     L  L
       enddo                                      ! 
+#ifdef USE_CUDA
+      endif
 #endif
       call dssum(w)         ! Gather-scatter operation  ! w   = QQ  w
                                                            !            L

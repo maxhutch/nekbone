@@ -13,6 +13,7 @@
 
 //#define DEBUG
 cublasHandle_t cublas_handle;
+//extern cublasHandle_t cublas_ctx;
 
 //#define AOS
 
@@ -1158,13 +1159,20 @@ extern "C"
     cudaFree(gpu_dom.comm_map[1].d_indices_from_COO);
     cudaFree(gpu_dom.comm_map[1].d_indices_to);
 
-    cudaFree(gpu_dom.d_w);
-    cudaFree(gpu_dom.d_p);
-    cudaFree(gpu_dom.d_g);
-    cudaFree(gpu_dom.d_dxm1);
-    cudaFree(gpu_dom.d_dxtm1);
-
     cudaCheckError();
+    cudaFree(gpu_dom.d_w);
+    cudaCheckError();
+    cudaFree(gpu_dom.d_p);
+    cudaCheckError();
+    cudaFree(gpu_dom.d_g);
+    cudaCheckError();
+    cudaFree(gpu_dom.d_dxm1);
+    cudaCheckError();
+    cudaFree(gpu_dom.d_dxtm1);
+    cudaCheckError();
+    cudaFree(gpu_dom.d_mask);
+    cudaCheckError();
+
 
     return;
   }
