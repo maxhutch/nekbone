@@ -11,6 +11,8 @@
 
 #include "cgcuda.h"
 
+#define WARP_SIZE 32
+
 //#define DEBUG
 cublasHandle_t cublas_handle;
 //extern cublasHandle_t cublas_ctx;
@@ -297,17 +299,6 @@ void local_scatter_cuda(double* out, double* in, gpu_map* map)
 
 }
 
-__global__
-void mask_kernel(double* w, int size, double* mask)
-{
-  int tid = threadIdx.x + blockDim.x*blockIdx.x;
-  int nthreads = blockDim.x*gridDim.x;
-  int i, j;
-  for (i = tid; i < size; i += nthreads){
-    j = ((int) mask[i]) - 1;
-    w[j] = 0.;
-  }
-}
 
 #if 0
   /*
@@ -838,12 +829,25 @@ void add2s1_cuda(double *a, double *b, double c1, int n)
   cudaCheckError();
 }
 
+__global__
+void mask_kernel(double* w, int size, double* mask)
+{
+  int tid = threadIdx.x + blockDim.x*blockIdx.x;
+  int nthreads = blockDim.x*gridDim.x;
+  int i, j;
+  for (i = tid; i < size; i += nthreads){
+    j = ((int) mask[i]) - 1;
+    w[j] = 0.;
+  }
+}
 
 void mask_cuda(double *w, int nid, double* mask, int mask_length)
 {
   if (1 || nid == 0)
   {
-    mask_kernel<<<1,128>>>(w,mask_length, mask);
+    int block = 128;
+    int grid = (mask_length + block - 1) / block;
+    mask_kernel<<<grid,block>>>(w,mask_length, mask);
   }
 }
 
@@ -863,41 +867,79 @@ void copy_cuda(double *a, double* b, int n)
 }
 
 
+__forceinline__ __device__
+double __shfl_down_double(double a, unsigned int delta)
+{
+  return __hiloint2double(__shfl_down(__double2hiint(a), delta),
+                          __shfl_down(__double2loint(a), delta));
+}
+
+#define GLSC3_BLOCK 256
+
+__forceinline__ __device__
+double breduce(volatile double *buf)
+{
+  int wid = threadIdx.x / WARP_SIZE;
+  int laneid = threadIdx.x % WARP_SIZE;
+  double a = buf[threadIdx.x];
+  #pragma unroll 5
+  for (int i = WARP_SIZE/2; i >= 1; i = i >> 1) {
+    double b = __shfl_down_double(a, i);
+    a += b;
+  }
+  if (laneid == 0)
+    buf[wid] = a;
+  __syncthreads();
+  if (wid == 0) {
+    if (laneid < GLSC3_BLOCK/WARP_SIZE)
+      a = buf[laneid];
+    else
+      a = 0;
+    for (int i = GLSC3_BLOCK/WARP_SIZE/2; i >= 1; i = i >> 1) {
+      double b = __shfl_down_double(a, i);
+      a += b;
+    }
+  }
+  return a;
+}
+
+
 __global__ 
 void glsc3_cuda_kernel(double* a, double* b, double* mult, double* result, int n)
 {
+  __shared__ double smem[GLSC3_BLOCK];
   int tid = blockIdx.x*blockDim.x+threadIdx.x;
-  while (tid < n)
+  if (tid < n)
   {
-    result[tid] = a[tid]*b[tid]*mult[tid];
-    tid += gridDim.x*blockDim.x;
+    smem[threadIdx.x] = a[tid]*b[tid]*mult[tid];
+  } else {
+    smem[threadIdx.x] = 0;
   }
+  __syncthreads();
+  double sum = breduce(smem);
+  if (threadIdx.x == 0)
+    result[blockIdx.x] = sum;
 }
+
 
 double glsc3_cuda(double *a, double* b, double* mult,  int n)
 {
   cudaCheckError();
 
-  double glsc3;
-  // TODO: This could be made faster by having a single kernel followed by reduction across block, 
-  // instead of writing to global memory
-  int cta_size = 128;
-  int grid_size=min(4096,( (n+cta_size-1)/cta_size));
+  int block = GLSC3_BLOCK;
+  int grid = (n+block-1)/block;
 
-  glsc3_cuda_kernel<<<grid_size,cta_size>>>(a,b,mult,gpu_dom.d_temp,n);
+  glsc3_cuda_kernel<<<grid,block>>>(a,b,mult,gpu_dom.d_temp,n);
 
-  thrust::device_ptr<double> beg(gpu_dom.d_temp);
-  glsc3 = thrust::reduce(beg,beg+n);
-  
- // printf("before reduce %e\n",glsc3);
-
+  double glsc3 = thrust::reduce((thrust::device_ptr<double>)gpu_dom.d_temp,
+                                (thrust::device_ptr<double>)(gpu_dom.d_temp+grid));
+ 
   exec_mpi_reduce_sum(&glsc3,&glsc3,&(gpu_dom.comm));
-
-  //printf("after educe %e\n",glsc3);
 
   cudaCheckError();
   return glsc3;
 }
+
 
 void solveM_cuda(double *z, double* r, int n)
 {
