@@ -18,6 +18,7 @@
 //#define DEBUG
 cublasHandle_t cublas_handle;
 //extern cublasHandle_t cublas_ctx;
+cudaStream_t stream[2];
 
 //#define AOS
 
@@ -327,27 +328,27 @@ void local_gather_cuda(double* out, const double* in,  gpu_map* map)
   cudaCheckError();
 }
 
-void local_gather_cuda_mask(double* out, const double* in,  gpu_map* map, int send_only)
+void local_gather_cuda_mask(double* out, const double* in,  gpu_map* map, int send_only, cudaStream_t &stream)
 //                       const uint *map_offsets, const uint* map_indices_from, const uint* map_indices_from_COO, const uint* map_indices_to, int size_from, int size_to)
 {
 
-  cudaCheckError();
+//   cudaCheckError();
 
   const int cta_size= 128;
   // const int grid_size = min(4096,(map->size_from+cta_size-1)/cta_size);
   const int grid_size = (map->size_from+cta_size-1)/cta_size;
-  cudaCheckError();
+//   cudaCheckError();
   if (send_only) {
-    local_gather_mask_kernel<double,1><<<grid_size,cta_size>>>(out,in,map->d_offsets,
+    local_gather_mask_kernel<double,1><<<grid_size,cta_size,0,stream>>>(out,in,map->d_offsets,
                                               map->d_indices_from,map->d_indices_to,map->size_from,
                                               d_send_mask);
   } else {
-    local_gather_mask_kernel<double,0><<<grid_size,cta_size>>>(out,in,map->d_offsets,
+    local_gather_mask_kernel<double,0><<<grid_size,cta_size,0,stream>>>(out,in,map->d_offsets,
                                                    map->d_indices_from,map->d_indices_to,map->size_from,
                                                    d_send_mask);
   }
   
-  cudaCheckError();
+//   cudaCheckError();
 }
 
 
@@ -372,6 +373,15 @@ void local_scatter_cuda(double* out, double* in, gpu_map* map)
   //local_scatter_kernel_COO<<<grid_size,cta_size>>>(out,in,map->d_indices_from_COO,map->d_indices_to,map->size_to);
   //cudaCheckError();
 
+}
+void local_scatter_cuda_stream(double* out, double* in, gpu_map* map, cudaStream_t &stream)
+{
+
+  const int cta_size= 128;
+  const int grid_size = min(4096,(map->size_from+cta_size-1)/cta_size);
+  local_scatter_kernel<<<grid_size,cta_size,0,stream>>>(out,in,map->d_offsets,
+                                               map->d_indices_from,map->d_indices_to,map->size_from );
+//   cudaCheckError();
 }
 
 
@@ -875,8 +885,8 @@ void gs_op_cuda(double* w, int dom, int op, int in_transpose)
 
 void gs_op_cuda_mpi(double* w, int dom, int op, int in_transpose)
 {
-  cudaDeviceSynchronize();
-  timer.Start();
+//   cudaDeviceSynchronize();
+//   timer.Start();
   cudaCheckError();
   bool transpose = (in_transpose!=0);
 
@@ -885,35 +895,36 @@ void gs_op_cuda_mpi(double* w, int dom, int op, int in_transpose)
   // Post mpi receives
   int recv_size = exec_mpi_recvs(gpu_dom.h_buffer, &(gpu_dom.comm), &(gpu_dom.comm_struct[recv]), gpu_dom.req);
 
-  local_gather_cuda_mask(w,w,&(gpu_dom.local_map[0^transpose]),1);
+  local_gather_cuda_mask(w,w,&(gpu_dom.local_map[0^transpose]),1,stream[0]);
 
-  cudaCheckError();
+//   cudaCheckError();
 
   // Fill send buffer
-  local_scatter_cuda(gpu_dom.d_buffer+recv_size, w, &(gpu_dom.comm_map[send]));
+  local_scatter_cuda_stream(gpu_dom.d_buffer+recv_size, w, &(gpu_dom.comm_map[send]),stream[0]);
+  cudaStreamSynchronize(stream[0]);
+
+  local_gather_cuda_mask(w,w,&(gpu_dom.local_map[0^transpose]),0,stream[1]);
 
   // Copy buffer from device to host
-  cudaMemcpy(gpu_dom.h_buffer+recv_size, gpu_dom.d_buffer+recv_size, 
-             gpu_dom.comm_map[send].size_to*sizeof(double), cudaMemcpyDeviceToHost);
-
+  cudaMemcpyAsync(gpu_dom.h_buffer+recv_size, gpu_dom.d_buffer+recv_size, 
+                  gpu_dom.comm_map[send].size_to*sizeof(double), cudaMemcpyDeviceToHost, stream[0]);
+  cudaStreamSynchronize(stream[0]);
   // Send host buffer
   int send_size = exec_mpi_sends( gpu_dom.h_buffer+recv_size, &(gpu_dom.comm), &(gpu_dom.comm_struct[send]), 
                                   &(gpu_dom.req[gpu_dom.comm_struct[recv].n ]));
-
-  local_gather_cuda_mask(w,w,&(gpu_dom.local_map[0^transpose]),0);
 
   // Wait for mpi communication to terminate
   exec_mpi_wait(gpu_dom.req, gpu_dom.comm_struct[0].n+gpu_dom.comm_struct[1].n);
 
   // Copy buffer from host to device
-  cudaMemcpy(gpu_dom.d_buffer, gpu_dom.h_buffer, recv_size*sizeof(double), cudaMemcpyHostToDevice);
-
+  cudaMemcpyAsync(gpu_dom.d_buffer, gpu_dom.h_buffer, recv_size*sizeof(double), cudaMemcpyHostToDevice,stream[0]);
+  cudaDeviceSynchronize();
   // Gather from buffer
   local_gather_cuda(w, gpu_dom.d_buffer, &(gpu_dom.comm_map[recv]) );
 
   local_scatter_cuda(w, w, &(gpu_dom.local_map[1^transpose]) );
-  cudaDeviceSynchronize();
-  time_gs += timer.GetET();
+//   cudaDeviceSynchronize();
+//   time_gs += timer.GetET();
 }
 
 
@@ -1203,7 +1214,8 @@ extern "C"
 //            gpu_dom.comm.id,
 //            gpu_dom.local_map[0].size_from, gpu_dom.local_map[1].size_from,
 //            gpu_dom.comm_map[0].size_from, gpu_dom.comm_map[1].size_from);
-    
+    for (int i = 0; i < 2; i++)
+      cudaStreamCreate(&stream[i]);
     uint* local_indices_from = (uint*)malloc(gpu_dom.local_map[0].size_from*sizeof(uint));
     uint* comm_indices_from = (uint*)malloc(gpu_dom.comm_map[1].size_from*sizeof(uint));
     cudaMemcpy(local_indices_from, gpu_dom.local_map[0].d_indices_from, 
