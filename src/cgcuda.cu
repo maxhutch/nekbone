@@ -1,5 +1,6 @@
 
 #include <stdio.h>
+#include <algorithm>
 #include "cuda_runtime.h"
 #include "cuda_util.h"
 #include "cublas_v2.h"
@@ -8,6 +9,7 @@
 #include "thrust/device_ptr.h"
 #include "thrust/reduce.h"
 #include "mpi.h"
+#include "cuda_profiler_api.h"
 
 #include "cgcuda.h"
 
@@ -18,6 +20,24 @@ cublasHandle_t cublas_handle;
 //extern cublasHandle_t cublas_ctx;
 
 //#define AOS
+
+#include <sys/time.h>
+
+class CTimer
+{
+protected:
+  timeval start,end;
+public:
+  void Start() {gettimeofday(&start, NULL);}
+  double GetET() {
+    gettimeofday(&end,NULL);
+    double et=(end.tv_sec+end.tv_usec*0.000001)-(start.tv_sec+start.tv_usec*0.000001);
+    return et;
+  }
+};
+
+CTimer timer, timer1;
+static double time_comm = 0, time_gs = 0;
 
 struct comm_data {
   uint n;      /* number of messages */
@@ -42,6 +62,8 @@ struct gpu_map
   uint* d_indices_from_COO;
   uint* d_indices_to;
 };
+
+static uint *send_mask, *d_send_mask;
 
 struct gpu_domain
 {
@@ -181,6 +203,11 @@ void fill_gpu_maps(gpu_map* cuda_map, const uint* map)
   cuda_map->size_from = size_from_tmp;
   cuda_map->size_to = size_to_tmp;
   cudaCheckError();
+
+  free(h_map_offsets);
+  free(h_map_indices_from);
+  free(h_map_indices_to);
+  free(h_map_indices_from_COO);
 }
 
 void fill_flagged_primaries_map(uint** d_flagged_primaries, const uint* flagged_primaries)
@@ -199,12 +226,37 @@ void local_init_kernel(T* __restrict__ out,  const uint* __restrict__ flagged_pr
 }
 
 
+template <typename T, int send_only>
+__global__
+void local_gather_mask_kernel(T* __restrict__ out, const T* __restrict__ in, 
+                         const uint* __restrict__ offsets, 
+                         const uint* __restrict__ map_indices_from, 
+                         const uint* __restrict__ map_indices_to, int size,
+                         uint* send_mask)
+{
+  for (int tid = blockDim.x*blockIdx.x + threadIdx.x; tid < size; tid+= gridDim.x * blockDim.x) 
+  {
+    if (send_only) {
+      if (send_mask[tid] == 0) continue;
+    } else {
+      if (send_mask[tid] == 1) continue;
+    }
+    uint store_loc = map_indices_from[tid];
+    T t = out[store_loc]; 
+    for (int i=offsets[tid];i<offsets[tid+1];i++)
+    {
+      t += in[map_indices_to[i]];
+    }
+    out[store_loc] = t;
+  }
+}
+
 template <typename T>
 __global__
 void local_gather_kernel(T* __restrict__ out, const T* __restrict__ in, 
                          const uint* __restrict__ offsets, 
                          const uint* __restrict__ map_indices_from, 
-                         const uint* __restrict__ map_indices_to, int size  )
+                         const uint* __restrict__ map_indices_to, int size)
 {
   for (int tid = blockDim.x*blockIdx.x + threadIdx.x; tid < size; tid+= gridDim.x * blockDim.x) 
   {
@@ -217,6 +269,7 @@ void local_gather_kernel(T* __restrict__ out, const T* __restrict__ in,
     out[store_loc] = t;
   }
 }
+
 
 template <typename T>
 __global__
@@ -259,8 +312,6 @@ void local_init_cuda(double* out, uint* flagged_primaries, int flagged_primaries
 }
 
 
-
-
 void local_gather_cuda(double* out, const double* in,  gpu_map* map)
 //                       const uint *map_offsets, const uint* map_indices_from, const uint* map_indices_from_COO, const uint* map_indices_to, int size_from, int size_to)
 {
@@ -268,10 +319,34 @@ void local_gather_cuda(double* out, const double* in,  gpu_map* map)
   cudaCheckError();
 
   const int cta_size= 128;
-  const int grid_size = min(4096,(map->size_from+cta_size-1)/cta_size);
+  // const int grid_size = min(4096,(map->size_from+cta_size-1)/cta_size);
+  const int grid_size = (map->size_from+cta_size-1)/cta_size;
   cudaCheckError();
   local_gather_kernel<<<grid_size,cta_size>>>(out,in,map->d_offsets,
                                               map->d_indices_from,map->d_indices_to,map->size_from);
+  cudaCheckError();
+}
+
+void local_gather_cuda_mask(double* out, const double* in,  gpu_map* map, int send_only)
+//                       const uint *map_offsets, const uint* map_indices_from, const uint* map_indices_from_COO, const uint* map_indices_to, int size_from, int size_to)
+{
+
+  cudaCheckError();
+
+  const int cta_size= 128;
+  // const int grid_size = min(4096,(map->size_from+cta_size-1)/cta_size);
+  const int grid_size = (map->size_from+cta_size-1)/cta_size;
+  cudaCheckError();
+  if (send_only) {
+    local_gather_mask_kernel<double,1><<<grid_size,cta_size>>>(out,in,map->d_offsets,
+                                              map->d_indices_from,map->d_indices_to,map->size_from,
+                                              d_send_mask);
+  } else {
+    local_gather_mask_kernel<double,0><<<grid_size,cta_size>>>(out,in,map->d_offsets,
+                                                   map->d_indices_from,map->d_indices_to,map->size_from,
+                                                   d_send_mask);
+  }
+  
   cudaCheckError();
 }
 
@@ -390,7 +465,11 @@ template<typename T>
 template<int p, int p_sq, int p_cube, int p_cube_padded, int pts_per_thread, int slab_size, int cta_size, int num_ctas>
 __global__
 __launch_bounds__(cta_size,num_ctas)
-void ax_cuda_kernel_v8_shared_D(const double* __restrict__ u_global, double* __restrict__ w, const double* __restrict__ g, const double* __restrict__ dxm1, const double* __restrict__ dxtm1, int n_cells)
+void ax_cuda_kernel_v8_shared_D(const double* __restrict__ u_global, 
+                                double* __restrict__ w, 
+                                const double* __restrict__ g, 
+                                const double* __restrict__ dxm1, 
+                                const double* __restrict__ dxtm1, int n_cells)
 {
   int tid = threadIdx.x;
   __shared__ double temp[cta_size];
@@ -646,16 +725,10 @@ void axcuda_e(double *w, double *u, double *g, double *dxm1, double *dxtm1,
         exit(1);
       }
 
-      cudaDeviceSetCacheConfig(cudaFuncCachePreferL1);
-      cudaDeviceSetSharedMemConfig(cudaSharedMemBankSizeEightByte);
+    cudaDeviceSetCacheConfig(cudaFuncCachePreferL1);
+    cudaDeviceSetSharedMemConfig(cudaSharedMemBankSizeEightByte);
 
-      float time;
-      cudaEvent_t start,stop;
-      cudaEventCreate(&start);
-      cudaEventCreate(&stop);
-      cudaEventRecord(start, 0);
 
-      //printf("
       if ( nx1 != 12 && nx1 != 9 )
       {
         printf("Current implementation only tested for polynomial orders 9 and 12, exiting");
@@ -699,11 +772,6 @@ void axcuda_e(double *w, double *u, double *g, double *dxm1, double *dxtm1,
           <<<grid_size,cta_size>>>(u, w, g, dxm1, dxtm1, nelt);
       }
 
-      cudaCheckError();
-      cudaEventRecord(stop,0);
-      cudaEventSynchronize(stop);
-
-      cudaEventElapsedTime(&time, start, stop);
       return;
 }
 
@@ -757,6 +825,8 @@ void exec_mpi_reduce_sum(double *val, double* output,
 
 void gs_op_cuda(double* w, int dom, int op, int in_transpose)
 {
+  cudaDeviceSynchronize();
+  timer.Start();
   cudaCheckError();
   bool transpose = (in_transpose!=0);
 
@@ -768,8 +838,11 @@ void gs_op_cuda(double* w, int dom, int op, int in_transpose)
   //local_init_cuda(w,gpu_dom.d_flagged_primaries,gpu_dom.flagged_primaries_size);
 
   cudaCheckError();
+  
   if (gpu_dom.comm.np > 1)
   {
+    cudaDeviceSynchronize();
+    timer1.Start();
     // Post mpi receives
     int recv_size = exec_mpi_recvs(gpu_dom.h_buffer, &(gpu_dom.comm), &(gpu_dom.comm_struct[recv]), gpu_dom.req);
 
@@ -781,11 +854,12 @@ void gs_op_cuda(double* w, int dom, int op, int in_transpose)
                gpu_dom.comm_map[send].size_to*sizeof(double), cudaMemcpyDeviceToHost);
 
     // Send host buffer
-    exec_mpi_sends( gpu_dom.h_buffer+recv_size, &(gpu_dom.comm), &(gpu_dom.comm_struct[send]), 
+    int send_size = exec_mpi_sends( gpu_dom.h_buffer+recv_size, &(gpu_dom.comm), &(gpu_dom.comm_struct[send]), 
                     &(gpu_dom.req[gpu_dom.comm_struct[recv].n ]));
 
     // Wait for mpi communication to terminate
     exec_mpi_wait(gpu_dom.req, gpu_dom.comm_struct[0].n+gpu_dom.comm_struct[1].n);
+    time_comm += timer.GetET();
 
     // Copy buffer from host to device
     cudaMemcpy(gpu_dom.d_buffer, gpu_dom.h_buffer, recv_size*sizeof(double), cudaMemcpyHostToDevice);
@@ -795,7 +869,53 @@ void gs_op_cuda(double* w, int dom, int op, int in_transpose)
   }
 
   local_scatter_cuda(w, w, &(gpu_dom.local_map[1^transpose]) );
+  cudaDeviceSynchronize();
+  time_gs += timer.GetET();
 }
+
+void gs_op_cuda_mpi(double* w, int dom, int op, int in_transpose)
+{
+  cudaDeviceSynchronize();
+  timer.Start();
+  cudaCheckError();
+  bool transpose = (in_transpose!=0);
+
+  const unsigned recv = 0^transpose, send = 1^transpose;
+
+  // Post mpi receives
+  int recv_size = exec_mpi_recvs(gpu_dom.h_buffer, &(gpu_dom.comm), &(gpu_dom.comm_struct[recv]), gpu_dom.req);
+
+  local_gather_cuda_mask(w,w,&(gpu_dom.local_map[0^transpose]),1);
+
+  cudaCheckError();
+
+  // Fill send buffer
+  local_scatter_cuda(gpu_dom.d_buffer+recv_size, w, &(gpu_dom.comm_map[send]));
+
+  // Copy buffer from device to host
+  cudaMemcpy(gpu_dom.h_buffer+recv_size, gpu_dom.d_buffer+recv_size, 
+             gpu_dom.comm_map[send].size_to*sizeof(double), cudaMemcpyDeviceToHost);
+
+  // Send host buffer
+  int send_size = exec_mpi_sends( gpu_dom.h_buffer+recv_size, &(gpu_dom.comm), &(gpu_dom.comm_struct[send]), 
+                                  &(gpu_dom.req[gpu_dom.comm_struct[recv].n ]));
+
+  local_gather_cuda_mask(w,w,&(gpu_dom.local_map[0^transpose]),0);
+
+  // Wait for mpi communication to terminate
+  exec_mpi_wait(gpu_dom.req, gpu_dom.comm_struct[0].n+gpu_dom.comm_struct[1].n);
+
+  // Copy buffer from host to device
+  cudaMemcpy(gpu_dom.d_buffer, gpu_dom.h_buffer, recv_size*sizeof(double), cudaMemcpyHostToDevice);
+
+  // Gather from buffer
+  local_gather_cuda(w, gpu_dom.d_buffer, &(gpu_dom.comm_map[recv]) );
+
+  local_scatter_cuda(w, w, &(gpu_dom.local_map[1^transpose]) );
+  cudaDeviceSynchronize();
+  time_gs += timer.GetET();
+}
+
 
 void add2s2_cuda(double *a, double *b, double c1, int n)
 {
@@ -941,6 +1061,43 @@ double glsc3_cuda(double *a, double* b, double* mult,  int n)
 }
 
 
+// __global__
+// void glsc3_cuda_kernel(double* a, double* b, double* mult, double* result, int n)
+// {
+//   int tid = blockIdx.x*blockDim.x+threadIdx.x;
+//   while (tid < n)
+//   {
+//     result[tid] = a[tid]*b[tid]*mult[tid];
+//     tid += gridDim.x*blockDim.x;
+//   }
+// }
+
+// double glsc3_cuda(double *a, double* b, double* mult,  int n)
+// {
+//   cudaCheckError();
+
+//   double glsc3;
+//   // TODO: This could be made faster by having a single kernel followed by reduction across block,
+//   // instead of writing to global memory
+//   int cta_size = 128;
+//   int grid_size=min(4096,( (n+cta_size-1)/cta_size));
+
+//   glsc3_cuda_kernel<<<grid_size,cta_size>>>(a,b,mult,gpu_dom.d_temp,n);
+
+//   thrust::device_ptr<double> beg(gpu_dom.d_temp);
+//   glsc3 = thrust::reduce(beg,beg+n);
+
+//   // printf("before reduce %e\n",glsc3);
+
+//   exec_mpi_reduce_sum(&glsc3,&glsc3,&(gpu_dom.comm));
+
+//   //printf("after educe %e\n",glsc3);
+
+//   cudaCheckError();
+//   return glsc3;
+// }
+
+
 void solveM_cuda(double *z, double* r, int n)
 {
   copy_cuda(z,r,n);
@@ -954,7 +1111,11 @@ void axcuda(double* w, double* u, double *g, double *dxm1, double* dxtm1,
   axcuda_e(w,u,g,dxm1,dxtm1,nx1,ny1,nz1,nelt,ldim);
 
   // TODO: Currently, parameters dom and op are ignored
-  gs_op_cuda(w,1,1,0); 
+  if (gpu_dom.comm.np > 1) {
+    gs_op_cuda_mpi(w,1,1,0);
+  } else  {
+    gs_op_cuda(w,1,1,0); 
+  }
 
   int n = nx1*ny1*nz1*nelt;
   add2s2_cuda(w,u,.1,n);
@@ -974,6 +1135,10 @@ extern "C"
     fill_gpu_maps( &(gpu_dom.local_map[1]), map_local_1);
 
     fill_flagged_primaries_map(&(gpu_dom.d_flagged_primaries),flagged_primaries);
+
+    send_mask = (uint*)malloc(sizeof(uint)*gpu_dom.local_map[0].size_from);
+    memset(send_mask, 0, sizeof(uint)*gpu_dom.local_map[0].size_from);
+    cudaMalloc(&d_send_mask, sizeof(uint)*gpu_dom.local_map[0].size_from);
   }
 
   void gs_comm_setup_cuda(const uint comm_0_n, const uint* comm_0_p, const uint* comm_0_size, const uint comm_0_total,
@@ -988,6 +1153,13 @@ extern "C"
     MPI_Comm_dup( (*mpi_comm), &(gpu_dom.comm.mpi_comm) );
     gpu_dom.comm.id = comm_id;
     gpu_dom.comm.np = comm_np;
+
+//     printf("******** P(%d): recv n = %d, tot = %d, send n = %d, tot = %d\n", 
+//            comm_id, comm_0_n, comm_0_total, comm_1_n, comm_1_total);
+//     for (int i = 0; i < comm_0_n; i++)
+//       printf("P(%d): recv %d size: %d\n", comm_id, i, comm_0_size[i]);
+//     for (int i = 0; i < comm_1_n; i++)
+//       printf("P(%d): send %d size: %d\n", comm_id, i, comm_1_size[i]);
 
     if (gpu_dom.comm.np > 1)
     {
@@ -1020,12 +1192,58 @@ extern "C"
     int device_id = (*nid)%gpu_count;
     cudaSetDevice(device_id);
     printf("rank %d selecting gpu %d\n",*nid,device_id);
+
   }
 
   void cg_cuda_init_(double* x, double* f, double* g, double* c, double* r, double* w, double* p, double* z, 
                      double* cmask,
                      int* nx1, int* ny1, int* nz1, int* nelt, int* ldim, double* dxm1, double* dxtm1, int* niter, double* flop_cg, const int *gsh_handle, int* nid)
   {
+//     printf("P(%d): local gather size_from = %d, scatter size_from = %d, send size_from = %d, recv size_from = %d\n", 
+//            gpu_dom.comm.id,
+//            gpu_dom.local_map[0].size_from, gpu_dom.local_map[1].size_from,
+//            gpu_dom.comm_map[0].size_from, gpu_dom.comm_map[1].size_from);
+    
+    uint* local_indices_from = (uint*)malloc(gpu_dom.local_map[0].size_from*sizeof(uint));
+    uint* comm_indices_from = (uint*)malloc(gpu_dom.comm_map[1].size_from*sizeof(uint));
+    cudaMemcpy(local_indices_from, gpu_dom.local_map[0].d_indices_from, 
+               gpu_dom.local_map[0].size_from*sizeof(uint), cudaMemcpyDeviceToHost);
+    cudaMemcpy(comm_indices_from, gpu_dom.comm_map[1].d_indices_from,
+               gpu_dom.comm_map[1].size_from*sizeof(uint), cudaMemcpyDeviceToHost);
+
+//     if (gpu_dom.comm.id == 1) {
+//     printf("local:\n");
+//     for (int i = 0; i < gpu_dom.local_map[0].size_from; i++) {
+//       printf("%d ", local_indices_from[i]);
+//     }
+//     printf("\n\n");
+//     printf("comm:\n");
+//     for (int j = 0; j < gpu_dom.comm_map[1].size_from; j++) {
+//       printf("%d ", comm_indices_from[j]);
+//     }
+//     printf("\n\n");
+//     }
+
+    for (int i = 0; i < gpu_dom.local_map[0].size_from; i++) {
+      int ind = local_indices_from[i];
+      if (std::binary_search(comm_indices_from, comm_indices_from+gpu_dom.comm_map[1].size_from, ind)) {
+        send_mask[i] = 1;
+      }
+    }
+    cudaMemcpy(d_send_mask, send_mask, gpu_dom.local_map[0].size_from*sizeof(uint),
+               cudaMemcpyHostToDevice);
+
+//     int count = 0;
+//     for (int i = 0; i < gpu_dom.local_map[0].size_from; i++) { 
+//       if (send_mask[i] == 1) count++;
+//     }
+//     printf("check send_mask = %d\n", count);
+
+    free(local_indices_from);
+    free(comm_indices_from);
+    
+
+
     // Initialize gpu_dom structure
     // Note: the gsh structure on the GPU is already initialized, since gs_cuda_setup is called in the proxy_setupds function in driver.f
 
@@ -1094,14 +1312,27 @@ extern "C"
     cudaMemcpy(gpu_dom.d_dxm1, dxm1, gpu_dom.nx1*gpu_dom.nx1*sizeof(double), cudaMemcpyHostToDevice);
     cudaMemcpy(gpu_dom.d_dxtm1, dxtm1, gpu_dom.nx1*gpu_dom.nx1*sizeof(double), cudaMemcpyHostToDevice);
 
+
+
     cudaCheckError();
 
     return;
   }
 
 
+  __global__ void init_t(double *t1, double *t2, double *t3, int n)
+  {
+    int tid = blockIdx.x*blockDim.x + threadIdx.x;
+    if (tid < n) {
+      t1[tid] = 1.0;
+      t2[tid] = 1.0;
+      t3[tid] = 1.0;
+    }
+  }
+
   void cg_cuda_(double* r, int* copy_to_cpu, double *flop_cg, double *flop_a)
   {
+    cudaProfilerStart();
     int n = gpu_dom.nx1 * gpu_dom.ny1 * gpu_dom.nz1 * gpu_dom.nelt;
     double pap = 0.0;
 
@@ -1123,6 +1354,21 @@ extern "C"
     mask_cuda(gpu_dom.d_r, gpu_dom.nid, gpu_dom.d_mask, gpu_dom.mask_length);
 
     double rnorm = sqrt(glsc3_cuda(gpu_dom.d_r, gpu_dom.d_c, gpu_dom.d_r, n));
+
+//     double *t1, *t2, *t3;
+//     cudaMalloc(&t1, n*sizeof(double));
+//     cudaMalloc(&t2, n*sizeof(double));
+//     cudaMalloc(&t3, n*sizeof(double));
+//     {
+//       int block = 256;
+//       int grid = (n + block - 1) / block;
+//       init_t<<<grid, block>>>(t1, t2, t3, n);
+//     }
+//     double t = glsc3_cuda(t1, t2, t3, n);
+//     printf("t = %f, n = %d\n", t, n);
+//     cudaFree(t1);
+//     cudaFree(t2);
+//     cudaFree(t3);
       
     int iter = 0;
     if (gpu_dom.nid==0) 
@@ -1172,7 +1418,11 @@ extern "C"
 
     if ((*copy_to_cpu)==1)
       cudaMemcpy(r, gpu_dom.d_r, n*sizeof(double), cudaMemcpyDeviceToHost);
+    if (gpu_dom.comm.id == 0) 
+    printf("P(%d): time_gs = %f ms, time_comm = %f ms\n", 
+           gpu_dom.nid, time_gs*1e3, time_comm*1e3);
 
+    cudaProfilerStop();
   }
 
   void cg_cuda_free_() 
