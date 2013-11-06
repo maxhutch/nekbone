@@ -15,6 +15,10 @@
 
 #define WARP_SIZE 32
 
+#define NO_COMM_MASK 0
+#define BOUNDARY_ONLY 1
+#define INTERIOR_ONLY 2
+
 //#define DEBUG
 cublasHandle_t cublas_handle;
 //extern cublasHandle_t cublas_ctx;
@@ -38,8 +42,8 @@ public:
 };
 
 CTimer timer, timer1, timer2;
-static double time_comm = 0, time_gs = 0;
-static double timeax[10] = {0,0,0,0,0,0,0,0,0,0};
+static float time_comm = 0, time_gs = 0;
+static float timeax[10] = {0,0,0,0,0,0,0,0,0,0};
 
 struct comm_data {
   uint n;      /* number of messages */
@@ -64,9 +68,6 @@ struct gpu_map
   uint* d_indices_from_COO;
   uint* d_indices_to;
 };
-
-static uint *send_mask, *d_send_mask;
-static uint *d_sendcell_mask;
 
 struct gpu_domain
 {
@@ -115,6 +116,8 @@ struct gpu_domain
 };
 
 static gpu_domain gpu_dom;
+static uint *d_send_mask;
+static uint *d_sendcell_mask;
 
 void init_comm_struct(comm_data* comm_struct, uint n, const uint* p, const uint* size, uint total)
 {
@@ -179,19 +182,6 @@ void fill_gpu_maps(gpu_map* cuda_map, const uint* map)
     h_map_offsets[count_from] = count_to; 
   } 
 
-//   printf("size_from=%d\n",size_from_tmp);
-//   printf("size_to=%d\n",size_to_tmp);
-//   for (int i = 0; i < size_from_tmp; i++) {
-//     printf("%d: ", h_map_indices_from[i]);
-//     for (int j = h_map_offsets[i]; j < h_map_offsets[i+1]; j++)
-//       printf("%d ", h_map_indices_to[j]);
-//     printf("\n");
-//   }
-//   printf("\n");
-//   for (int i = 0; i < size_to_tmp; i++)
-//     printf("%d ", h_map_indices_to[i]);
-//   printf("\n");
-
   cudaCheckError();
   cudaMalloc((void **) &(cuda_map->d_offsets), (size_from_tmp+1)*sizeof(uint));
   cudaMalloc((void **) &(cuda_map->d_indices_from), size_from_tmp*sizeof(uint));
@@ -229,7 +219,7 @@ void local_init_kernel(T* __restrict__ out,  const uint* __restrict__ flagged_pr
 }
 
 
-template <typename T, int send_only>
+template <typename T, int comm_mask>
 __global__
 void local_gather_mask_kernel(T* __restrict__ out, const T* __restrict__ in, 
                          const uint* __restrict__ offsets, 
@@ -239,9 +229,9 @@ void local_gather_mask_kernel(T* __restrict__ out, const T* __restrict__ in,
 {
   for (int tid = blockDim.x*blockIdx.x + threadIdx.x; tid < size; tid+= gridDim.x * blockDim.x) 
   {
-    if (send_only) {
+    if (comm_mask == BOUNDARY_ONLY) { 
       if (send_mask[tid] == 0) continue;
-    } else {
+    } else if (comm_mask == INTERIOR_ONLY) { 
       if (send_mask[tid] == 1) continue;
     }
     uint store_loc = map_indices_from[tid];
@@ -304,7 +294,6 @@ void local_scatter_kernel_COO(T* __restrict__ out, const T* __restrict__ in,  co
 }
 
 void local_init_cuda(double* out, uint* flagged_primaries, int flagged_primaries_size)
-//                       const uint *map_offsets, const uint* map_indices_from, const uint* map_indices_from_COO, const uint* map_indices_to, int size_from, int size_to)
 {
 
   const int cta_size= 128;
@@ -314,90 +303,49 @@ void local_init_cuda(double* out, uint* flagged_primaries, int flagged_primaries
   cudaCheckError();
 }
 
-
-void local_gather_cuda(double* out, const double* in,  gpu_map* map)
-//                       const uint *map_offsets, const uint* map_indices_from, const uint* map_indices_from_COO, const uint* map_indices_to, int size_from, int size_to)
+void local_gather_cuda(double* out, const double* in,  gpu_map* map, int comm_mask, cudaStream_t stream)
 {
-
   cudaCheckError();
-
-  const int cta_size= 128;
-  const int grid_size = min(4096,(map->size_from+cta_size-1)/cta_size);
-  //const int grid_size = (map->size_from+cta_size-1)/cta_size;
-  cudaCheckError();
-  local_gather_kernel<<<grid_size,cta_size>>>(out,in,map->d_offsets,
-                                              map->d_indices_from,map->d_indices_to,map->size_from);
-  cudaCheckError();
-}
-
-void local_gather_cuda_stream(double* out, const double* in,  gpu_map* map, cudaStream_t stream)
-{
-
-  cudaCheckError();
-
-  const int cta_size= 128;
-  const int grid_size = min(4096,(map->size_from+cta_size-1)/cta_size);
-  //const int grid_size = (map->size_from+cta_size-1)/cta_size;
-  cudaCheckError();
-  local_gather_kernel<<<grid_size,cta_size,0,stream>>>(out,in,map->d_offsets,
-                                              map->d_indices_from,map->d_indices_to,map->size_from);
-  cudaCheckError();
-}
-
-void local_gather_cuda_mask(double* out, const double* in,  gpu_map* map, int send_only, cudaStream_t &stream)
-//                       const uint *map_offsets, const uint* map_indices_from, const uint* map_indices_from_COO, const uint* map_indices_to, int size_from, int size_to)
-{
-
-//   cudaCheckError();
 
   const int cta_size= 128;
   // const int grid_size = min(4096,(map->size_from+cta_size-1)/cta_size);
   const int grid_size = (map->size_from+cta_size-1)/cta_size;
-//   cudaCheckError();
-  if (send_only) {
-    local_gather_mask_kernel<double,1><<<grid_size,cta_size,0,stream>>>(out,in,map->d_offsets,
-                                              map->d_indices_from,map->d_indices_to,map->size_from,
-                                              d_send_mask);
-  } else {
-    local_gather_mask_kernel<double,0><<<grid_size,cta_size,0,stream>>>(out,in,map->d_offsets,
-                                                   map->d_indices_from,map->d_indices_to,map->size_from,
-                                                   d_send_mask);
+  switch (comm_mask) {
+  case NO_COMM_MASK: 
+    local_gather_mask_kernel<double,NO_COMM_MASK><<<grid_size,cta_size,0,stream>>>
+      (out,in,map->d_offsets,
+       map->d_indices_from,map->d_indices_to,map->size_from,
+       d_send_mask);
+    break;
+  case BOUNDARY_ONLY: 
+    local_gather_mask_kernel<double,BOUNDARY_ONLY><<<grid_size,cta_size,0,stream>>>
+      (out,in,map->d_offsets,
+       map->d_indices_from,map->d_indices_to,map->size_from,
+       d_send_mask);
+    break;
+  case INTERIOR_ONLY: 
+    local_gather_mask_kernel<double,INTERIOR_ONLY><<<grid_size,cta_size,0,stream>>>
+      (out,in,map->d_offsets,
+       map->d_indices_from,map->d_indices_to,map->size_from,
+       d_send_mask);
+    break;
+  default: 
+    printf("invalid mask value!\n");
+    exit(1);
   }
   
-//   cudaCheckError();
-}
-
-
-
-//void local_scatter_cuda(double* out, const double* in,
-//                       const uint *map_offsets, const uint* map_indices_from, const uint* map_indices_from_COO, const uint* map_indices_to, int size_from, int size_to)
-//
-void local_scatter_cuda(double* out, double* in, gpu_map* map)
-//  pdouble* out, const double* in,
-//                       const uint *map_offsets, const uint* map_indices_from, const uint* map_indices_from_COO, const uint* map_indices_to, int size_from, int size_to)
-{
-
-  const int cta_size= 128;
-  const int grid_size = min(4096,(map->size_from+cta_size-1)/cta_size);
-  //const int grid_size = min(1,(map->size_from+cta_size-1)/cta_size);
-  local_scatter_kernel<<<grid_size,cta_size>>>(out,in,map->d_offsets,
-                                               map->d_indices_from,map->d_indices_to,map->size_from );
   cudaCheckError();
-
-  //const int cta_size= 128;
-  //const int grid_size = min(4096,(map->size_to+cta_size-1)/cta_size);
-  //local_scatter_kernel_COO<<<grid_size,cta_size>>>(out,in,map->d_indices_from_COO,map->d_indices_to,map->size_to);
-  //cudaCheckError();
-
 }
-void local_scatter_cuda_stream(double* out, double* in, gpu_map* map, cudaStream_t &stream)
+
+void local_scatter_cuda(double* out, double* in, gpu_map* map, cudaStream_t stream)
 {
+  cudaCheckError();
 
   const int cta_size= 128;
   const int grid_size = min(4096,(map->size_from+cta_size-1)/cta_size);
   local_scatter_kernel<<<grid_size,cta_size,0,stream>>>(out,in,map->d_offsets,
                                                map->d_indices_from,map->d_indices_to,map->size_from );
-//   cudaCheckError();
+  cudaCheckError();
 }
 
 
@@ -488,316 +436,7 @@ template<typename T>
     return;
   }
 
-template<int p, int p_sq, int p_cube, int p_cube_padded, int pts_per_thread, int slab_size, int cta_size, int num_ctas>
-__global__
-__launch_bounds__(cta_size,num_ctas)
-void ax_cuda_kernel_v8_shared_D(const double* __restrict__ u_global, 
-                                double* __restrict__ w, 
-                                const double* __restrict__ g, 
-                                const double* __restrict__ dxm1, 
-                                const double* __restrict__ dxtm1, int n_cells)
-{
-  int tid = threadIdx.x;
-  __shared__ double temp[cta_size];
-  __shared__ double s_dxm1[p_sq];
-  __shared__ double s_dxtm1[p_sq];
-
-  for (int cell_id=blockIdx.x; cell_id < n_cells; cell_id += gridDim.x)
-  {
-    // Load u in shared for the entire cell
-    int offset = cell_id*p_cube;
-
-    int tid_mod_p = tid%p;
-    int tid_div_p = tid/p;
-    int tid_mod_p_sq = tid%p_sq;
-    int tid_div_p_sq = tid/p_sq;
-
-    double u[pts_per_thread];
-    #pragma unroll
-    for (int k=0;k<pts_per_thread;k++)
-    {
-      int pt_id = k*cta_size + tid;
-
-      u[k] = ld_functions::ld_cg(&u_global[offset + pt_id]);
-    }
-
-    // Store dxm1 and dxtm1 in shared memory
-    if (tid < p_sq)
-    {
-      s_dxm1[tid] = ld_functions::ld_cg(&dxm1[tid]);
-      s_dxtm1[tid] = ld_functions::ld_cg(&dxtm1[tid]);
-    }
-
-
-    // Initialize wa to 0.
-    double wa[pts_per_thread];
-    #pragma unroll
-    for (int k=0;k<pts_per_thread;k++)
-      wa[k] = 0.;
-
-    // Now compute w for one slab at a time
-    #pragma unroll
-    for (int k=0;k<pts_per_thread;k++)
-    {
-      int pt_id = k*cta_size + tid;
-      //int pt_id_div_p = pt_id/p;
-      //int pt_id_mod_p = pt_id%p;
-      int pt_id_div_p_sq = pt_id/p_sq;
-      //int pt_id_mod_p_sq = pt_id%p_sq;
-
-      double ur, us, ut;
-
-      // Load first slab in shared memory
-      __syncthreads();
-      temp[tid] = u[k];
-      __syncthreads();
-      
-
-      //  Now that data is loaded in shared, compute ur
-      {
-        int s_offset = tid_div_p*p;
-        int d_offset  = tid_mod_p;
-
-        ur = 0.;
-        #pragma unroll
-        for (int i=0;i<p;i++)
-          ur += s_dxm1[d_offset + p*i]*temp[s_offset + i];
-          //ur += __ldg(&dxm1[d_offset + p*i])*temp[s_offset + i];
-      }
-
-      // Compute us
-      {
-        int plane = tid_div_p_sq;
-        int s_offset = plane*p_sq + tid_mod_p;
-        int d_offset = p*( (tid-plane*p_sq)/p);
-
-        us = 0.;
-        #pragma unroll
-        for (int i=0;i<p;i++)
-          us += temp[s_offset + p*i]*s_dxtm1[d_offset + i];
-         // us += temp[s_offset + p*i]*__ldg(&dxtm1[d_offset + i]);
-      }
-
-
-      // Load all slabs in shared, one by one to compute ut
-      ut = 0.;
-      #pragma unroll
-      for (int k2=0;k2<pts_per_thread;k2++)
-      {
-        int i_start = k2*slab_size;
-
-        // Load in shared
-        __syncthreads();
-        temp[tid] = u[k2];
-        __syncthreads();
-
-        // Compute ut
-        int s_offset = tid_mod_p_sq;
-        int d_offset = pt_id_div_p_sq*p;
-
-        #pragma unroll
-        for (int icount=0;icount<slab_size;icount++)
-        {
-          //ut += temp[s_offset + p_sq*icount]*__ldg(&dxtm1[d_offset + i_start]);
-          ut += temp[s_offset + p_sq*icount]*s_dxtm1[d_offset + i_start];
-          i_start++;
-        }
-      }
-
-      // Transform
-      {
-
-
-        /*
-        int offset = (cell_id*p_cube + pt_id)*6;
-        //TODO: Switch to SOA
-        double metric[6];
-        #pragma unroll
-        for (int i=0;i<6;i++)
-          metric[i] = g[offset+i];
-
-        */
-
-        // AoS version
-#ifdef AOS
-        int offset = cell_id*p_cube + pt_id;
-        //TODO: Switch to SOA
-        double metric[6];
-        #pragma unroll
-        for (int i=0;i<6;i++)
-          metric[i] = g[offset+i*n_cells*p_cube];
-#else
-        int offset = (cell_id*p_cube + pt_id)*6;
-        double metric[6];
-        #pragma unroll
-        for (int i=0;i<6;i++)
-          metric[i] = g[offset+i];
-#endif
-          //metric[i] = ld_functions::ld_cg(&g[offset+i*n_cells*p_cube]);
-          //metric[i] = g[offset+i*n_cells*p_cube];
-
-          //metric[i] = ld_functions::ld_cg(&g[offset+i]);
-          //metric[i] = g[offset+i];
-
-
-        // SOA HACK
-        /*
-        int offset = cell_id*p_cube + pt_id;
-
-        //TODO: Switch to SOA
-        double metric[6];
-        #pragma unroll
-        for (int i=0;i<6;i++)
-        {
-          //metric[i] = g[offset];
-          metric[i] = ld_functions::ld_cg(&g[offset]);
-          offset += n_cells*p_cube;
-        }
-        */
-
-
-
-          //metric[i] = ld_functions::ld_cg(&(g[offset+i]));
-
-        double wr = metric[0]*ur + metric[1]*us + metric[2]*ut;
-        double ws = metric[1]*ur + metric[3]*us + metric[4]*ut;
-        double wt = metric[2]*ur + metric[4]*us + metric[5]*ut;
-
-        ur = wr;
-        us = ws;
-        ut = wt;
-      }
-
-      // Store ur in shared memory
-      __syncthreads();
-      temp[tid] = ur;
-      __syncthreads();
-
-      // Now that data is loaded in shared, compute wa
-
-      {
-        int d_offset  = tid_mod_p;
-        int s_offset = tid_div_p*p;
-
-        #pragma unroll
-        for (int i=0;i<p;i++)
-          wa[k] += s_dxtm1[d_offset+p*i]*temp[s_offset + i];
-          //wa[k] += __ldg(&dxtm1[d_offset+p*i])*temp[s_offset + i];
-      }
-
-      __syncthreads();
-      temp[tid] = us;
-      __syncthreads();
-
-      // Compute us
-      {
-
-        int plane = tid_div_p_sq;
-        int s_offset = plane*p_sq + tid_mod_p;
-        int d_offset = p*( (tid-plane*p_sq)/p);
-
-        #pragma unroll
-        for (int i=0;i<p;i++)
-          wa[k] += temp[s_offset + p*i]*s_dxm1[d_offset + i];
-          //wa[k] += temp[s_offset + p*i]*__ldg(&dxm1[d_offset + i]);
-      }
-
-      __syncthreads();
-      // Store ut in shared memory
-      temp[tid] = ut;
-      __syncthreads();
-
-      #pragma unroll
-      for (int k2=0;k2<pts_per_thread;k2++)
-      {
-        int i_start = k*slab_size;
-        int pt_id_2 = k2*cta_size + tid;
-        int plane = pt_id_2/p_sq;
-
-        int s_offset = tid_mod_p_sq;
-        int d_offset = plane*p;
-
-        #pragma unroll
-        for (int i_count=0; i_count < slab_size; i_count++)
-        {
-          wa[k2] += temp[s_offset + p_sq*i_count]*s_dxm1[d_offset + i_start];
-          //wa[k2] += temp[s_offset + p_sq*i_count]*__ldg(&dxm1[d_offset + i_start]);
-          i_start++;
-        }
-      }
-      __syncthreads();
-
-    } // Loop over k
-
-    #pragma unroll
-    for (int k=0;k<pts_per_thread;k++)
-    {
-      int pt_id = k*cta_size + tid;
-      w[offset + pt_id] = wa[k];
-    }
-  } // Loop over blocks
-
-}
-
-//
-// Matrix-vector kernel
-//
-void axcuda_e(double *w, double *u, double *g, double *dxm1, double *dxtm1, 
-              int nx1, int ny1, int nz1, int nelt, int ldim) 
-{
-      if ( nx1 != ny1 || nx1 != nz1)
-      {
-        printf("non-cubic elements not supported in Cuda version\n");
-        exit(1);
-      }
-
-      if ( nx1 != 12 && nx1 != 9 )
-      {
-        printf("Current implementation only tested for polynomial orders 9 and 12, exiting");
-        exit(1);
-      }
-      else if ( nx1 == 9 )
-      {
-        const int grid_size = nelt;
-        const int p = 9;
-        const int p_sq = 9*9;
-        const int p_cube = 9*9*9;
-        const int p_cube_padded = p_cube;
-
-        const int cta_size = 243;
-        const int pts_per_thread = 3;  // 6*288 = 12*12*12
-        const int slab_size = 3;
-
-        const int num_ctas = 4;
-
-        ax_cuda_kernel_v8_shared_D<p,p_sq,p_cube,p_cube_padded,pts_per_thread,slab_size,cta_size,num_ctas>
-          <<<grid_size,cta_size>>>(u, w, g, dxm1, dxtm1, nelt);
-      }
-      else if ( nx1 == 12 )
-      {
-        // 12x12x12 case
-        const int p = 12;
-        const int p_sq = 12*12;
-        const int p_cube = 12*12*12;
-        const int p_cube_padded = p_cube;
-
-        // We could play with this
-        const int grid_size = nelt;
-
-        // BEST CONFIG
-        const int cta_size = 576;
-        const int pts_per_thread = 3;  // 6*288 = 12*12*12
-        const int slab_size = 4;
-        const int num_ctas = 2;
-
-        ax_cuda_kernel_v8_shared_D<p,p_sq,p_cube,p_cube_padded,pts_per_thread,slab_size,cta_size,num_ctas>
-          <<<grid_size,cta_size>>>(u, w, g, dxm1, dxtm1, nelt);
-      }
-
-      return;
-}
-
-template<int p, int p_sq, int p_cube, int p_cube_padded, int pts_per_thread, int slab_size, int cta_size, int num_ctas, int send_only>
+template<int p, int p_sq, int p_cube, int p_cube_padded, int pts_per_thread, int slab_size, int cta_size, int num_ctas, int comm_mask>
 __global__
 __launch_bounds__(cta_size,num_ctas)
 void ax_cuda_kernel_v9_shared_D(const double* __restrict__ u_global, 
@@ -815,9 +454,9 @@ void ax_cuda_kernel_v9_shared_D(const double* __restrict__ u_global,
   //for (int cell_id=blockIdx.x; cell_id < n_cells; cell_id += gridDim.x)
   int cell_id = blockIdx.x;
   {
-    if (send_only) {
+    if (comm_mask == BOUNDARY_ONLY) {
       if (sendcell_mask[cell_id] == 0) return;
-    } else {
+    } else if (comm_mask == INTERIOR_ONLY) {
       if (sendcell_mask[cell_id] == 1) return;
     }
     // Load u in shared for the entire cell
@@ -1056,8 +695,8 @@ void ax_cuda_kernel_v9_shared_D(const double* __restrict__ u_global,
 }
 
 
-void axcuda_e_mask(double *w, double *u, double *g, double *dxm1, double *dxtm1, 
-                   int nx1, int ny1, int nz1, int nelt, int ldim, int send_only, cudaStream_t stream)
+void axcuda_e(double *w, double *u, double *g, double *dxm1, double *dxtm1, 
+              int nx1, int ny1, int nz1, int nelt, int ldim, int comm_mask, cudaStream_t stream)
 {
       if ( nx1 != ny1 || nx1 != nz1)
       {
@@ -1070,7 +709,8 @@ void axcuda_e_mask(double *w, double *u, double *g, double *dxm1, double *dxtm1,
         printf("Current implementation only tested for polynomial orders 9 and 12, exiting");
         exit(1);
       }
-      else if ( nx1 == 9 )
+
+      if ( nx1 == 9 )
       {
         const int grid_size = nelt;
         const int p = 9;
@@ -1083,16 +723,23 @@ void axcuda_e_mask(double *w, double *u, double *g, double *dxm1, double *dxtm1,
         const int slab_size = 3;
 
         const int num_ctas = 4;
-        
-        if (send_only) {
-          ax_cuda_kernel_v9_shared_D<p,p_sq,p_cube,p_cube_padded,pts_per_thread,slab_size,cta_size,num_ctas,1>
+        switch (comm_mask) {
+        case NO_COMM_MASK:
+          ax_cuda_kernel_v9_shared_D<p,p_sq,p_cube,p_cube_padded,pts_per_thread,slab_size,cta_size,num_ctas,NO_COMM_MASK>
             <<<grid_size,cta_size,0,stream>>>(u, w, g, dxm1, dxtm1, nelt, d_sendcell_mask);
-        } else {
-          ax_cuda_kernel_v9_shared_D<p,p_sq,p_cube,p_cube_padded,pts_per_thread,slab_size,cta_size,num_ctas,0>
+          break;
+        case BOUNDARY_ONLY: 
+          ax_cuda_kernel_v9_shared_D<p,p_sq,p_cube,p_cube_padded,pts_per_thread,slab_size,cta_size,num_ctas,BOUNDARY_ONLY>
             <<<grid_size,cta_size,0,stream>>>(u, w, g, dxm1, dxtm1, nelt, d_sendcell_mask);
+          break;
+        case INTERIOR_ONLY: 
+          ax_cuda_kernel_v9_shared_D<p,p_sq,p_cube,p_cube_padded,pts_per_thread,slab_size,cta_size,num_ctas,INTERIOR_ONLY>
+            <<<grid_size,cta_size,0,stream>>>(u, w, g, dxm1, dxtm1, nelt, d_sendcell_mask);
+          break;
         }
       }
-      else if ( nx1 == 12 )
+
+      if ( nx1 == 12 )
       {
         // 12x12x12 case
         const int p = 12;
@@ -1109,12 +756,19 @@ void axcuda_e_mask(double *w, double *u, double *g, double *dxm1, double *dxtm1,
         const int slab_size = 4;
         const int num_ctas = 2;
 
-        if (send_only) {
-          ax_cuda_kernel_v9_shared_D<p,p_sq,p_cube,p_cube_padded,pts_per_thread,slab_size,cta_size,num_ctas,1>
+        switch (comm_mask) {
+        case NO_COMM_MASK:
+          ax_cuda_kernel_v9_shared_D<p,p_sq,p_cube,p_cube_padded,pts_per_thread,slab_size,cta_size,num_ctas,NO_COMM_MASK>
             <<<grid_size,cta_size,0,stream>>>(u, w, g, dxm1, dxtm1, nelt, d_sendcell_mask);
-        } else {
-          ax_cuda_kernel_v9_shared_D<p,p_sq,p_cube,p_cube_padded,pts_per_thread,slab_size,cta_size,num_ctas,0>
+          break;
+        case BOUNDARY_ONLY: 
+          ax_cuda_kernel_v9_shared_D<p,p_sq,p_cube,p_cube_padded,pts_per_thread,slab_size,cta_size,num_ctas,BOUNDARY_ONLY>
             <<<grid_size,cta_size,0,stream>>>(u, w, g, dxm1, dxtm1, nelt, d_sendcell_mask);
+          break;
+        case INTERIOR_ONLY: 
+          ax_cuda_kernel_v9_shared_D<p,p_sq,p_cube,p_cube_padded,pts_per_thread,slab_size,cta_size,num_ctas,INTERIOR_ONLY>
+            <<<grid_size,cta_size,0,stream>>>(u, w, g, dxm1, dxtm1, nelt, d_sendcell_mask);
+          break;
         }
       }
 
@@ -1179,7 +833,7 @@ void gs_op_cuda(double* w, int dom, int op, int in_transpose)
 
   const unsigned recv = 0^transpose, send = 1^transpose;
 
-  local_gather_cuda(w,w,&(gpu_dom.local_map[0^transpose]));
+  local_gather_cuda(w,w,&(gpu_dom.local_map[0^transpose]), NO_COMM_MASK, NULL);
 
   cudaCheckError();
   //local_init_cuda(w,gpu_dom.d_flagged_primaries,gpu_dom.flagged_primaries_size);
@@ -1194,7 +848,7 @@ void gs_op_cuda(double* w, int dom, int op, int in_transpose)
     int recv_size = exec_mpi_recvs(gpu_dom.h_buffer, &(gpu_dom.comm), &(gpu_dom.comm_struct[recv]), gpu_dom.req);
 
     // Fill send buffer
-    local_scatter_cuda(gpu_dom.d_buffer+recv_size, w, &(gpu_dom.comm_map[send]));
+    local_scatter_cuda(gpu_dom.d_buffer+recv_size, w, &(gpu_dom.comm_map[send]), NULL);
 
     // Copy buffer from device to host
     cudaMemcpy(gpu_dom.h_buffer+recv_size, gpu_dom.d_buffer+recv_size, 
@@ -1212,10 +866,10 @@ void gs_op_cuda(double* w, int dom, int op, int in_transpose)
     cudaMemcpy(gpu_dom.d_buffer, gpu_dom.h_buffer, recv_size*sizeof(double), cudaMemcpyHostToDevice);
 
     // Gather from buffer
-    local_gather_cuda(w, gpu_dom.d_buffer, &(gpu_dom.comm_map[recv]) );
+    local_gather_cuda(w, gpu_dom.d_buffer, &(gpu_dom.comm_map[recv]), NO_COMM_MASK, NULL );
   }
 
-  local_scatter_cuda(w, w, &(gpu_dom.local_map[1^transpose]) );
+  local_scatter_cuda(w, w, &(gpu_dom.local_map[1^transpose]), NULL);
   cudaDeviceSynchronize();
   time_gs += timer.GetET();
 }
@@ -1232,15 +886,15 @@ void gs_op_cuda_mpi(double* w, int dom, int op, int in_transpose)
   // Post mpi receives
   int recv_size = exec_mpi_recvs(gpu_dom.h_buffer, &(gpu_dom.comm), &(gpu_dom.comm_struct[recv]), gpu_dom.req);
 
-  local_gather_cuda_mask(w,w,&(gpu_dom.local_map[0^transpose]),1,stream[0]);
+  local_gather_cuda(w,w,&(gpu_dom.local_map[0^transpose]),BOUNDARY_ONLY,stream[0]);
 
 //   cudaCheckError();
 
   // Fill send buffer
-  local_scatter_cuda_stream(gpu_dom.d_buffer+recv_size, w, &(gpu_dom.comm_map[send]),stream[0]);
+  local_scatter_cuda(gpu_dom.d_buffer+recv_size, w, &(gpu_dom.comm_map[send]), stream[0]);
   cudaStreamSynchronize(stream[0]);
 
-  local_gather_cuda_mask(w,w,&(gpu_dom.local_map[0^transpose]),0,stream[1]);
+  local_gather_cuda(w,w,&(gpu_dom.local_map[0^transpose]),INTERIOR_ONLY,stream[1]);
 
   // Copy buffer from device to host
   cudaMemcpyAsync(gpu_dom.h_buffer+recv_size, gpu_dom.d_buffer+recv_size, 
@@ -1257,9 +911,9 @@ void gs_op_cuda_mpi(double* w, int dom, int op, int in_transpose)
   cudaMemcpyAsync(gpu_dom.d_buffer, gpu_dom.h_buffer, recv_size*sizeof(double), cudaMemcpyHostToDevice,stream[0]);
   cudaDeviceSynchronize();
   // Gather from buffer
-  local_gather_cuda(w, gpu_dom.d_buffer, &(gpu_dom.comm_map[recv]) );
+  local_gather_cuda(w, gpu_dom.d_buffer, &(gpu_dom.comm_map[recv]), NO_COMM_MASK, NULL );
 
-  local_scatter_cuda(w, w, &(gpu_dom.local_map[1^transpose]) );
+  local_scatter_cuda(w, w, &(gpu_dom.local_map[1^transpose]), NULL);
 //   cudaDeviceSynchronize();
 //   time_gs += timer.GetET();
 }
@@ -1451,14 +1105,30 @@ void solveM_cuda(double *z, double* r, int n)
   copy_cuda(z,r,n);
 }
 
-void axcuda(double* w, double* u, double *g, double *dxm1, double* dxtm1,
+void axcuda_no_overlap(double* w, double* u, double *g, double *dxm1, double* dxtm1,
             int nx1, int ny1, int nz1, int nelt, int ldim, int nid, 
 	    double* mask, int mask_length, double* flop_a)
 {
 
-  axcuda_e(w,u,g,dxm1,dxtm1,nx1,ny1,nz1,nelt,ldim);
-//   axcuda_e_mask(w,u,g,dxm1,dxtm1,nx1,ny1,nz1,nelt,ldim,1,NULL);
-//   axcuda_e_mask(w,u,g,dxm1,dxtm1,nx1,ny1,nz1,nelt,ldim,0,NULL);
+  axcuda_e(w,u,g,dxm1,dxtm1,nx1,ny1,nz1,nelt,ldim,NO_COMM_MASK,NULL);
+
+  // TODO: Currently, parameters dom and op are ignored
+  gs_op_cuda(w,1,1,0); 
+
+  int n = nx1*ny1*nz1*nelt;
+  add2s2_cuda(w,u,.1,n);
+  mask_cuda(w,nid, mask, mask_length);
+
+  int nxyz = nx1*ny1*nz1;
+  *flop_a += (19*nxyz+12*nx1*nxyz)*nelt;
+}
+
+void axcuda_part_overlap(double* w, double* u, double *g, double *dxm1, double* dxtm1,
+            int nx1, int ny1, int nz1, int nelt, int ldim, int nid, 
+	    double* mask, int mask_length, double* flop_a)
+{
+
+  axcuda_e(w,u,g,dxm1,dxtm1,nx1,ny1,nz1,nelt,ldim,NO_COMM_MASK,NULL);
 
   // TODO: Currently, parameters dom and op are ignored
   if (gpu_dom.comm.np > 1) {
@@ -1475,13 +1145,12 @@ void axcuda(double* w, double* u, double *g, double *dxm1, double* dxtm1,
   *flop_a += (19*nxyz+12*nx1*nxyz)*nelt;
 }
 
-void axcuda_v2(double* w, double* u, double *g, double *dxm1, double* dxtm1,
+void axcuda_tot_overlap(double* w, double* u, double *g, double *dxm1, double* dxtm1,
             int nx1, int ny1, int nz1, int nelt, int ldim, int nid, 
 	    double* mask, int mask_length, double* flop_a)
 {
-//   axcuda_e(w,u,g,dxm1,dxtm1,nx1,ny1,nz1,nelt,ldim);
   timer.Start();
-  axcuda_e_mask(w,u,g,dxm1,dxtm1,nx1,ny1,nz1,nelt,ldim,1,stream[0]);
+  axcuda_e(w,u,g,dxm1,dxtm1,nx1,ny1,nz1,nelt,ldim,BOUNDARY_ONLY,NULL);
   cudaDeviceSynchronize();
   timeax[1] += timer.GetET();
 
@@ -1495,22 +1164,23 @@ void axcuda_v2(double* w, double* u, double *g, double *dxm1, double* dxtm1,
   // Post mpi receives
   int recv_size = exec_mpi_recvs(gpu_dom.h_buffer, &(gpu_dom.comm), &(gpu_dom.comm_struct[recv]), gpu_dom.req);
 
-  local_gather_cuda_mask(w,w,&(gpu_dom.local_map[0^transpose]),1,stream[0]);
+  local_gather_cuda(w, w, &(gpu_dom.local_map[0^transpose]), BOUNDARY_ONLY, NULL);
 
   // Fill send buffer
-  local_scatter_cuda_stream(gpu_dom.d_buffer+recv_size, w, &(gpu_dom.comm_map[send]),stream[0]);
-  cudaStreamSynchronize(stream[0]);
+  local_scatter_cuda(gpu_dom.d_buffer+recv_size, w, &(gpu_dom.comm_map[send]), NULL);
+  cudaDeviceSynchronize();
   timeax[2] += timer.GetET();
   timer.Start();
 
   // interior points kernels: Ax and gather
-  axcuda_e_mask(w,u,g,dxm1,dxtm1,nx1,ny1,nz1,nelt,ldim,0,stream[1]);
-  local_gather_cuda_mask(w,w,&(gpu_dom.local_map[0^transpose]),0,stream[1]);
+  axcuda_e(w,u,g,dxm1,dxtm1,nx1,ny1,nz1,nelt,ldim,INTERIOR_ONLY,stream[1]);
+  local_gather_cuda(w,w,&(gpu_dom.local_map[0^transpose]),INTERIOR_ONLY,stream[1]);
 
   // Copy buffer from device to host
   cudaMemcpyAsync(gpu_dom.h_buffer+recv_size, gpu_dom.d_buffer+recv_size, 
                   gpu_dom.comm_map[send].size_to*sizeof(double), cudaMemcpyDeviceToHost, stream[0]);
   cudaStreamSynchronize(stream[0]);
+
   // Send host buffer
   int send_size = exec_mpi_sends( gpu_dom.h_buffer+recv_size, &(gpu_dom.comm), &(gpu_dom.comm_struct[send]), 
                                   &(gpu_dom.req[gpu_dom.comm_struct[recv].n ]));
@@ -1522,16 +1192,13 @@ void axcuda_v2(double* w, double* u, double *g, double *dxm1, double* dxtm1,
   // Copy buffer from host to device, overlaps with interior points kernels
   cudaMemcpyAsync(gpu_dom.d_buffer, gpu_dom.h_buffer, recv_size*sizeof(double), cudaMemcpyHostToDevice,stream[0]);
 
-
- 
   // Gather from buffer
-//   local_gather_cuda(w, gpu_dom.d_buffer, &(gpu_dom.comm_map[recv]) );
-  local_gather_cuda_stream(w, gpu_dom.d_buffer, &(gpu_dom.comm_map[recv]), stream[0]);
+  local_gather_cuda(w, gpu_dom.d_buffer, &(gpu_dom.comm_map[recv]), NO_COMM_MASK, stream[0]);
   cudaDeviceSynchronize();
   timeax[3] += timer.GetET();
   timer.Start();
 
-  local_scatter_cuda(w, w, &(gpu_dom.local_map[1^transpose]) );
+  local_scatter_cuda(w, w, &(gpu_dom.local_map[1^transpose]), NULL);
   cudaDeviceSynchronize();
   timeax[4] += timer.GetET();
 
@@ -1565,9 +1232,6 @@ extern "C"
 
     fill_flagged_primaries_map(&(gpu_dom.d_flagged_primaries),flagged_primaries);
 
-    send_mask = (uint*)malloc(sizeof(uint)*gpu_dom.local_map[0].size_from);
-    memset(send_mask, 0, sizeof(uint)*gpu_dom.local_map[0].size_from);
-    cudaMalloc(&d_send_mask, sizeof(uint)*gpu_dom.local_map[0].size_from);
   }
 
   void gs_comm_setup_cuda(const uint comm_0_n, const uint* comm_0_p, const uint* comm_0_size, const uint comm_0_total,
@@ -1656,21 +1320,25 @@ extern "C"
 //     }
 //     printf("\n\n");
 //     }
+    // 
+    // setup send point mask
+    //
+    {
+      uint *send_mask = (uint*)malloc(sizeof(uint)*gpu_dom.local_map[0].size_from);
+      memset(send_mask, 0, sizeof(uint)*gpu_dom.local_map[0].size_from);
+      cudaMalloc(&d_send_mask, sizeof(uint)*gpu_dom.local_map[0].size_from);
 
-    for (int i = 0; i < gpu_dom.local_map[0].size_from; i++) {
-      int ind = local_indices_from[i];
-      if (std::binary_search(comm_indices_from, comm_indices_from+gpu_dom.comm_map[1].size_from, ind)) {
-        send_mask[i] = 1;
+      for (int i = 0; i < gpu_dom.local_map[0].size_from; i++) {
+        int ind = local_indices_from[i];
+        if (std::binary_search(comm_indices_from, comm_indices_from+gpu_dom.comm_map[1].size_from, ind)) {
+          send_mask[i] = 1;
+        }
       }
+      cudaMemcpy(d_send_mask, send_mask, gpu_dom.local_map[0].size_from*sizeof(uint),
+                 cudaMemcpyHostToDevice);
+      free(send_mask);
     }
-    cudaMemcpy(d_send_mask, send_mask, gpu_dom.local_map[0].size_from*sizeof(uint),
-               cudaMemcpyHostToDevice);
 
-//     int count = 0;
-//     for (int i = 0; i < gpu_dom.local_map[0].size_from; i++) { 
-//       if (send_mask[i] == 1) count++;
-//     }
-//     printf("check send_mask = %d\n", count);
     //
     // setup cell mask
     // 
@@ -1686,11 +1354,6 @@ extern "C"
       }
       cudaMemcpy(d_sendcell_mask, sendcell_mask, sizeof(uint)*(*nelt),
                  cudaMemcpyHostToDevice);
-//       int count = 0;
-//       for (int i = 0; i < *nelt; i++) {
-//         if (sendcell_mask[i] == 1) count++;
-//       }
-//       printf("P(%d): nelt = %d, sendcell = %d\n", gpu_dom.comm.id, *nelt, count);
       free(sendcell_mask);
     }
 
@@ -1852,11 +1515,11 @@ extern "C"
        add2s1_cuda(gpu_dom.d_p, gpu_dom.d_z, beta, n);
        
        if (gpu_dom.comm.np == 1) {
-         axcuda(gpu_dom.d_w, gpu_dom.d_p, gpu_dom.d_g, gpu_dom.d_dxm1, gpu_dom.d_dxtm1, gpu_dom.nx1, gpu_dom.ny1, gpu_dom.nz1, gpu_dom.nelt, gpu_dom.ldim, gpu_dom.nid, gpu_dom.d_mask, gpu_dom.mask_length, flop_a);         
+         axcuda_no_overlap(gpu_dom.d_w, gpu_dom.d_p, gpu_dom.d_g, gpu_dom.d_dxm1, gpu_dom.d_dxtm1, gpu_dom.nx1, gpu_dom.ny1, gpu_dom.nz1, gpu_dom.nelt, gpu_dom.ldim, gpu_dom.nid, gpu_dom.d_mask, gpu_dom.mask_length, flop_a);         
        } else {
          cudaDeviceSynchronize();
          timer2.Start();
-         axcuda_v2(gpu_dom.d_w, gpu_dom.d_p, gpu_dom.d_g, gpu_dom.d_dxm1, gpu_dom.d_dxtm1, gpu_dom.nx1, gpu_dom.ny1, gpu_dom.nz1, gpu_dom.nelt, gpu_dom.ldim, gpu_dom.nid, gpu_dom.d_mask, gpu_dom.mask_length, flop_a);
+         axcuda_tot_overlap(gpu_dom.d_w, gpu_dom.d_p, gpu_dom.d_g, gpu_dom.d_dxm1, gpu_dom.d_dxtm1, gpu_dom.nx1, gpu_dom.ny1, gpu_dom.nz1, gpu_dom.nelt, gpu_dom.ldim, gpu_dom.nid, gpu_dom.d_mask, gpu_dom.mask_length, flop_a);
          cudaDeviceSynchronize();
          timeax[0] += timer2.GetET();
        }
@@ -1888,14 +1551,26 @@ extern "C"
 //     printf("P(%d): time_gs = %f ms, time_comm = %f ms\n", 
 //            gpu_dom.nid, time_gs*1e3, time_comm*1e3);
 
-    printf("P(%d): timeax = %f, %f, %f, %f, %f, %f\n",
-           gpu_dom.comm.id, timeax[0]*1e3, timeax[1]*1e3, timeax[2]*1e3, timeax[3]*1e3, timeax[4]*1e3, timeax[5]*1e3);
 
     cudaProfilerStop();
   }
 
   void cg_cuda_free_() 
   {
+    float maxtime;
+    MPI_Allreduce(timeax, &maxtime, 1, MPI_FLOAT, MPI_MAX, gpu_dom.comm.mpi_comm);
+    if (fabs(timeax[0] - maxtime) < 1e-5 || gpu_dom.comm.id == 0) {
+    printf("P(%d): timeax = %f, %f, %f, %f, %f, %f\n",
+           gpu_dom.comm.id, timeax[0]*1e3, timeax[1]*1e3, 
+           timeax[2]*1e3, timeax[3]*1e3, timeax[4]*1e3, timeax[5]*1e3);
+    }
+
+    for (int i = 0; i < 2; i++)
+      cudaStreamDestroy(stream[i]);
+
+    cudaFree(d_send_mask);
+    cudaFree(d_sendcell_mask);
+
     /* free GPU memory for u, w, ur, us, ut, g, dxm1, dxtm1  */
 
     cudaCheckError();
