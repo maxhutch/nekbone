@@ -24,6 +24,8 @@ cublasHandle_t cublas_handle;
 //extern cublasHandle_t cublas_ctx;
 cudaStream_t stream[2];
 
+//#define TIME_AX
+
 //#define AOS
 
 #include <sys/time.h>
@@ -41,9 +43,13 @@ public:
   }
 };
 
+bool nonZero(uint i) { return (i > 0); }
+
 CTimer timer, timer1, timer2;
 static float time_comm = 0, time_gs = 0;
+#ifdef TIME_AX
 static float timeax[10] = {0,0,0,0,0,0,0,0,0,0};
+#endif
 
 struct comm_data {
   uint n;      /* number of messages */
@@ -1149,12 +1155,15 @@ void axcuda_tot_overlap(double* w, double* u, double *g, double *dxm1, double* d
             int nx1, int ny1, int nz1, int nelt, int ldim, int nid, 
 	    double* mask, int mask_length, double* flop_a)
 {
+#ifdef TIME_AX
   timer.Start();
+#endif
   axcuda_e(w,u,g,dxm1,dxtm1,nx1,ny1,nz1,nelt,ldim,BOUNDARY_ONLY,NULL);
+#ifdef TIME_AX
   cudaDeviceSynchronize();
   timeax[1] += timer.GetET();
-
   timer.Start();
+#endif
 
   int in_transpose = 0;
   bool transpose = (in_transpose!=0);
@@ -1168,9 +1177,11 @@ void axcuda_tot_overlap(double* w, double* u, double *g, double *dxm1, double* d
 
   // Fill send buffer
   local_scatter_cuda(gpu_dom.d_buffer+recv_size, w, &(gpu_dom.comm_map[send]), NULL);
+#ifdef TIME_AX
   cudaDeviceSynchronize();
   timeax[2] += timer.GetET();
   timer.Start();
+#endif
 
   // interior points kernels: Ax and gather
   axcuda_e(w,u,g,dxm1,dxtm1,nx1,ny1,nz1,nelt,ldim,INTERIOR_ONLY,stream[1]);
@@ -1194,22 +1205,18 @@ void axcuda_tot_overlap(double* w, double* u, double *g, double *dxm1, double* d
 
   // Gather from buffer
   local_gather_cuda(w, gpu_dom.d_buffer, &(gpu_dom.comm_map[recv]), NO_COMM_MASK, stream[0]);
+#ifdef TIME_AX
   cudaDeviceSynchronize();
   timeax[3] += timer.GetET();
   timer.Start();
+#endif
 
   local_scatter_cuda(w, w, &(gpu_dom.local_map[1^transpose]), NULL);
+#ifdef TIME_AX
   cudaDeviceSynchronize();
   timeax[4] += timer.GetET();
-
   timer.Start();
-
-//   // TODO: Currently, parameters dom and op are ignored
-//   if (gpu_dom.comm.np > 1) {
-//     gs_op_cuda_mpi(w,1,1,0);
-//   } else  {
-//     gs_op_cuda(w,1,1,0); 
-//   }
+#endif
 
   int n = nx1*ny1*nz1*nelt;
   add2s2_cuda(w,u,.1,n);
@@ -1217,8 +1224,10 @@ void axcuda_tot_overlap(double* w, double* u, double *g, double *dxm1, double* d
 
   int nxyz = nx1*ny1*nz1;
   *flop_a += (19*nxyz+12*nx1*nxyz)*nelt;
+#ifdef TIME_AX
   cudaDeviceSynchronize();
   timeax[5] += timer.GetET();
+#endif
 }
 
 
@@ -1253,7 +1262,6 @@ extern "C"
 //       printf("P(%d): recv %d size: %d\n", comm_id, i, comm_0_size[i]);
 //     for (int i = 0; i < comm_1_n; i++)
 //       printf("P(%d): send %d size: %d\n", comm_id, i, comm_1_size[i]);
-
     if (gpu_dom.comm.np > 1)
     {
       // Initialize the communication structure
@@ -1293,6 +1301,7 @@ extern "C"
                      int* nx1, int* ny1, int* nz1, int* nelt, int* ldim, double* dxm1, double* dxtm1, 
                      int* niter, double* flop_cg, const int *gsh_handle, int* nid)
   {
+//     if (gpu_dom.comm.id == 53)
 //     printf("P(%d): local gather size_from = %d, scatter size_from = %d, send size_from = %d, recv size_from = %d\n", 
 //            gpu_dom.comm.id,
 //            gpu_dom.local_map[0].size_from, gpu_dom.local_map[1].size_from,
@@ -1336,6 +1345,9 @@ extern "C"
       }
       cudaMemcpy(d_send_mask, send_mask, gpu_dom.local_map[0].size_from*sizeof(uint),
                  cudaMemcpyHostToDevice);
+//       if (gpu_dom.comm.id == 53)
+//       printf("P(%d): send_mask = %d\n", gpu_dom.comm.id,
+//              std::count_if(send_mask, send_mask+gpu_dom.local_map[0].size_from, nonZero));
       free(send_mask);
     }
 
@@ -1354,6 +1366,9 @@ extern "C"
       }
       cudaMemcpy(d_sendcell_mask, sendcell_mask, sizeof(uint)*(*nelt),
                  cudaMemcpyHostToDevice);
+//       if (gpu_dom.comm.id == 53)
+//       printf("P(%d): sendcell_mask = %d, nelt = %d\n", gpu_dom.comm.id,
+//              std::count_if(sendcell_mask, sendcell_mask+(*nelt), nonZero), *nelt);
       free(sendcell_mask);
     }
 
@@ -1509,25 +1524,23 @@ extern "C"
        if (iter==1) 
          beta=0.0;
 
-#ifdef DEBUG
-       printf("rtz1 = %12.8g\n",rtz1);
-#endif
        add2s1_cuda(gpu_dom.d_p, gpu_dom.d_z, beta, n);
        
        if (gpu_dom.comm.np == 1) {
          axcuda_no_overlap(gpu_dom.d_w, gpu_dom.d_p, gpu_dom.d_g, gpu_dom.d_dxm1, gpu_dom.d_dxtm1, gpu_dom.nx1, gpu_dom.ny1, gpu_dom.nz1, gpu_dom.nelt, gpu_dom.ldim, gpu_dom.nid, gpu_dom.d_mask, gpu_dom.mask_length, flop_a);         
        } else {
+#ifdef TIME_AX
          cudaDeviceSynchronize();
          timer2.Start();
+#endif
          axcuda_tot_overlap(gpu_dom.d_w, gpu_dom.d_p, gpu_dom.d_g, gpu_dom.d_dxm1, gpu_dom.d_dxtm1, gpu_dom.nx1, gpu_dom.ny1, gpu_dom.nz1, gpu_dom.nelt, gpu_dom.ldim, gpu_dom.nid, gpu_dom.d_mask, gpu_dom.mask_length, flop_a);
+#ifdef TIME_AX
          cudaDeviceSynchronize();
          timeax[0] += timer2.GetET();
+#endif
        }
 
        pap = glsc3_cuda(gpu_dom.d_w, gpu_dom.d_c, gpu_dom.d_p, n);
-#ifdef DEBUG
-       printf("pap = %12.8g\n",pap);
-#endif
        alpha=rtz1/pap;
        double alphm = -alpha;
 
@@ -1537,7 +1550,6 @@ extern "C"
        double rtr = glsc3_cuda(gpu_dom.d_r, gpu_dom.d_c, gpu_dom.d_r, n);
 
        rnorm = sqrt(rtr);
-//       printf("RNORM: %e \n", rnorm);
     }
 
     *flop_cg += miter*15.0*n + 3.0*n;
@@ -1557,13 +1569,19 @@ extern "C"
 
   void cg_cuda_free_() 
   {
-    float maxtime;
-    MPI_Allreduce(timeax, &maxtime, 1, MPI_FLOAT, MPI_MAX, gpu_dom.comm.mpi_comm);
-    if (fabs(timeax[0] - maxtime) < 1e-5 || gpu_dom.comm.id == 0) {
-    printf("P(%d): timeax = %f, %f, %f, %f, %f, %f\n",
-           gpu_dom.comm.id, timeax[0]*1e3, timeax[1]*1e3, 
-           timeax[2]*1e3, timeax[3]*1e3, timeax[4]*1e3, timeax[5]*1e3);
-    }
+//     {
+//     float maxtime;
+//     MPI_Allreduce(timeax, &maxtime, 1, MPI_FLOAT, MPI_MAX, gpu_dom.comm.mpi_comm);
+//     if (fabs(timeax[0] - maxtime) < 1e-5 || gpu_dom.comm.id == 0) {
+//     printf("P(%d): timeax = %f, %f, %f, %f, %f, %f\n",
+//            gpu_dom.comm.id, timeax[0]*1e3, timeax[1]*1e3, 
+//            timeax[2]*1e3, timeax[3]*1e3, timeax[4]*1e3, timeax[5]*1e3);
+//     printf("P(%d): local gather size_from = %d, scatter size_from = %d, send size_from = %d, recv size_from = %d\n", 
+//            gpu_dom.comm.id,
+//            gpu_dom.local_map[0].size_from, gpu_dom.local_map[1].size_from,
+//            gpu_dom.comm_map[0].size_from, gpu_dom.comm_map[1].size_from);
+//     }
+//     }
 
     for (int i = 0; i < 2; i++)
       cudaStreamDestroy(stream[i]);
