@@ -44,6 +44,7 @@ public:
 };
 
 bool nonZero(uint i) { return (i > 0); }
+bool eqOne(uint i) { return (i == 1); }
 
 CTimer timer, timer1, timer2;
 static float time_comm = 0, time_gs = 0;
@@ -124,6 +125,7 @@ struct gpu_domain
 static gpu_domain gpu_dom;
 static uint *d_send_mask;
 static uint *d_sendcell_mask;
+static int nsend_cell, nint_cell, *d_int_cell, *d_send_cell;
 
 void init_comm_struct(comm_data* comm_struct, uint n, const uint* p, const uint* size, uint total)
 {
@@ -444,7 +446,7 @@ template<typename T>
 
 template<int p, int p_sq, int p_cube, int p_cube_padded, int pts_per_thread, int slab_size, int cta_size, int num_ctas, int comm_mask>
 __global__
-__launch_bounds__(cta_size,num_ctas)
+//__launch_bounds__(cta_size,num_ctas)
 void ax_cuda_kernel_v9_shared_D(const double* __restrict__ u_global, 
                                 double* __restrict__ w, 
                                 const double* __restrict__ g, 
@@ -701,6 +703,264 @@ void ax_cuda_kernel_v9_shared_D(const double* __restrict__ u_global,
 }
 
 
+template<int p, int p_sq, int p_cube, int p_cube_padded, int pts_per_thread, int slab_size, int cta_size, int num_ctas, int comm_mask>
+__global__
+__launch_bounds__(cta_size,num_ctas)
+void ax_cuda_kernel_v10_shared_D(const double* __restrict__ u_global, 
+                                double* __restrict__ w, 
+                                const double* __restrict__ g, 
+                                const double* __restrict__ dxm1, 
+                                const double* __restrict__ dxtm1, int n_cells, 
+                                int *d_cell)
+{
+  int tid = threadIdx.x;
+  __shared__ double temp[cta_size];
+  __shared__ double s_dxm1[p_sq];
+  __shared__ double s_dxtm1[p_sq];
+
+  //for (int cell_id=blockIdx.x; cell_id < n_cells; cell_id += gridDim.x)
+  int cell_id;
+  if (comm_mask == NO_COMM_MASK) 
+    cell_id = blockIdx.x;
+  else
+    cell_id = d_cell[blockIdx.x];
+  {
+    // Load u in shared for the entire cell
+    int offset = cell_id*p_cube;
+
+    int tid_mod_p = tid%p;
+    int tid_div_p = tid/p;
+    int tid_mod_p_sq = tid%p_sq;
+    int tid_div_p_sq = tid/p_sq;
+
+    double u[pts_per_thread];
+    #pragma unroll
+    for (int k=0;k<pts_per_thread;k++)
+    {
+      int pt_id = k*cta_size + tid;
+
+      u[k] = ld_functions::ld_cg(&u_global[offset + pt_id]);
+    }
+
+    // Store dxm1 and dxtm1 in shared memory
+    if (tid < p_sq)
+    {
+      s_dxm1[tid] = ld_functions::ld_cg(&dxm1[tid]);
+      s_dxtm1[tid] = ld_functions::ld_cg(&dxtm1[tid]);
+    }
+
+
+    // Initialize wa to 0.
+    double wa[pts_per_thread];
+    #pragma unroll
+    for (int k=0;k<pts_per_thread;k++)
+      wa[k] = 0.;
+
+    // Now compute w for one slab at a time
+    #pragma unroll
+    for (int k=0;k<pts_per_thread;k++)
+    {
+      int pt_id = k*cta_size + tid;
+      //int pt_id_div_p = pt_id/p;
+      //int pt_id_mod_p = pt_id%p;
+      int pt_id_div_p_sq = pt_id/p_sq;
+      //int pt_id_mod_p_sq = pt_id%p_sq;
+
+      double ur, us, ut;
+
+      // Load first slab in shared memory
+      __syncthreads();
+      temp[tid] = u[k];
+      __syncthreads();
+      
+
+      //  Now that data is loaded in shared, compute ur
+      {
+        int s_offset = tid_div_p*p;
+        int d_offset  = tid_mod_p;
+
+        ur = 0.;
+        #pragma unroll
+        for (int i=0;i<p;i++)
+          ur += s_dxm1[d_offset + p*i]*temp[s_offset + i];
+          //ur += __ldg(&dxm1[d_offset + p*i])*temp[s_offset + i];
+      }
+
+      // Compute us
+      {
+        int plane = tid_div_p_sq;
+        int s_offset = plane*p_sq + tid_mod_p;
+        int d_offset = p*( (tid-plane*p_sq)/p);
+
+        us = 0.;
+        #pragma unroll
+        for (int i=0;i<p;i++)
+          us += temp[s_offset + p*i]*s_dxtm1[d_offset + i];
+         // us += temp[s_offset + p*i]*__ldg(&dxtm1[d_offset + i]);
+      }
+
+
+      // Load all slabs in shared, one by one to compute ut
+      ut = 0.;
+      #pragma unroll
+      for (int k2=0;k2<pts_per_thread;k2++)
+      {
+        int i_start = k2*slab_size;
+
+        // Load in shared
+        __syncthreads();
+        temp[tid] = u[k2];
+        __syncthreads();
+
+        // Compute ut
+        int s_offset = tid_mod_p_sq;
+        int d_offset = pt_id_div_p_sq*p;
+
+        #pragma unroll
+        for (int icount=0;icount<slab_size;icount++)
+        {
+          //ut += temp[s_offset + p_sq*icount]*__ldg(&dxtm1[d_offset + i_start]);
+          ut += temp[s_offset + p_sq*icount]*s_dxtm1[d_offset + i_start];
+          i_start++;
+        }
+      }
+
+      // Transform
+      {
+
+
+        /*
+        int offset = (cell_id*p_cube + pt_id)*6;
+        //TODO: Switch to SOA
+        double metric[6];
+        #pragma unroll
+        for (int i=0;i<6;i++)
+          metric[i] = g[offset+i];
+
+        */
+
+        // AoS version
+#ifdef AOS
+        int offset = cell_id*p_cube + pt_id;
+        //TODO: Switch to SOA
+        double metric[6];
+        #pragma unroll
+        for (int i=0;i<6;i++)
+          metric[i] = g[offset+i*n_cells*p_cube];
+#else
+        int offset = (cell_id*p_cube + pt_id)*6;
+        double metric[6];
+        #pragma unroll
+        for (int i=0;i<6;i++)
+          metric[i] = g[offset+i];
+#endif
+          //metric[i] = ld_functions::ld_cg(&g[offset+i*n_cells*p_cube]);
+          //metric[i] = g[offset+i*n_cells*p_cube];
+
+          //metric[i] = ld_functions::ld_cg(&g[offset+i]);
+          //metric[i] = g[offset+i];
+
+
+        // SOA HACK
+        /*
+        int offset = cell_id*p_cube + pt_id;
+
+        //TODO: Switch to SOA
+        double metric[6];
+        #pragma unroll
+        for (int i=0;i<6;i++)
+        {
+          //metric[i] = g[offset];
+          metric[i] = ld_functions::ld_cg(&g[offset]);
+          offset += n_cells*p_cube;
+        }
+        */
+
+
+
+          //metric[i] = ld_functions::ld_cg(&(g[offset+i]));
+
+        double wr = metric[0]*ur + metric[1]*us + metric[2]*ut;
+        double ws = metric[1]*ur + metric[3]*us + metric[4]*ut;
+        double wt = metric[2]*ur + metric[4]*us + metric[5]*ut;
+
+        ur = wr;
+        us = ws;
+        ut = wt;
+      }
+
+      // Store ur in shared memory
+      __syncthreads();
+      temp[tid] = ur;
+      __syncthreads();
+
+      // Now that data is loaded in shared, compute wa
+
+      {
+        int d_offset  = tid_mod_p;
+        int s_offset = tid_div_p*p;
+
+        #pragma unroll
+        for (int i=0;i<p;i++)
+          wa[k] += s_dxtm1[d_offset+p*i]*temp[s_offset + i];
+          //wa[k] += __ldg(&dxtm1[d_offset+p*i])*temp[s_offset + i];
+      }
+
+      __syncthreads();
+      temp[tid] = us;
+      __syncthreads();
+
+      // Compute us
+      {
+
+        int plane = tid_div_p_sq;
+        int s_offset = plane*p_sq + tid_mod_p;
+        int d_offset = p*( (tid-plane*p_sq)/p);
+
+        #pragma unroll
+        for (int i=0;i<p;i++)
+          wa[k] += temp[s_offset + p*i]*s_dxm1[d_offset + i];
+          //wa[k] += temp[s_offset + p*i]*__ldg(&dxm1[d_offset + i]);
+      }
+
+      __syncthreads();
+      // Store ut in shared memory
+      temp[tid] = ut;
+      __syncthreads();
+
+      #pragma unroll
+      for (int k2=0;k2<pts_per_thread;k2++)
+      {
+        int i_start = k*slab_size;
+        int pt_id_2 = k2*cta_size + tid;
+        int plane = pt_id_2/p_sq;
+
+        int s_offset = tid_mod_p_sq;
+        int d_offset = plane*p;
+
+        #pragma unroll
+        for (int i_count=0; i_count < slab_size; i_count++)
+        {
+          wa[k2] += temp[s_offset + p_sq*i_count]*s_dxm1[d_offset + i_start];
+          //wa[k2] += temp[s_offset + p_sq*i_count]*__ldg(&dxm1[d_offset + i_start]);
+          i_start++;
+        }
+      }
+      __syncthreads();
+
+    } // Loop over k
+
+    #pragma unroll
+    for (int k=0;k<pts_per_thread;k++)
+    {
+      int pt_id = k*cta_size + tid;
+      w[offset + pt_id] = wa[k];
+    }
+  } // Loop over blocks
+
+}
+
+
 void axcuda_e(double *w, double *u, double *g, double *dxm1, double *dxtm1, 
               int nx1, int ny1, int nz1, int nelt, int ldim, int comm_mask, cudaStream_t stream)
 {
@@ -718,7 +978,6 @@ void axcuda_e(double *w, double *u, double *g, double *dxm1, double *dxtm1,
 
       if ( nx1 == 9 )
       {
-        const int grid_size = nelt;
         const int p = 9;
         const int p_sq = 9*9;
         const int p_cube = 9*9*9;
@@ -729,18 +988,36 @@ void axcuda_e(double *w, double *u, double *g, double *dxm1, double *dxtm1,
         const int slab_size = 3;
 
         const int num_ctas = 4;
+//         switch (comm_mask) {
+//         case NO_COMM_MASK:
+//           ax_cuda_kernel_v9_shared_D<p,p_sq,p_cube,p_cube_padded,pts_per_thread,slab_size,cta_size,num_ctas,NO_COMM_MASK>
+//             <<<grid_size,cta_size,0,stream>>>(u, w, g, dxm1, dxtm1, nelt, d_sendcell_mask);
+//           break;
+//         case BOUNDARY_ONLY: 
+//           ax_cuda_kernel_v9_shared_D<p,p_sq,p_cube,p_cube_padded,pts_per_thread,slab_size,cta_size,num_ctas,BOUNDARY_ONLY>
+//             <<<grid_size,cta_size,0,stream>>>(u, w, g, dxm1, dxtm1, nelt, d_sendcell_mask);
+//           break;
+//         case INTERIOR_ONLY: 
+//           ax_cuda_kernel_v9_shared_D<p,p_sq,p_cube,p_cube_padded,pts_per_thread,slab_size,cta_size,num_ctas,INTERIOR_ONLY>
+//             <<<grid_size,cta_size,0,stream>>>(u, w, g, dxm1, dxtm1, nelt, d_sendcell_mask);
+//           break;
+//         }
+        int grid_size;
         switch (comm_mask) {
-        case NO_COMM_MASK:
-          ax_cuda_kernel_v9_shared_D<p,p_sq,p_cube,p_cube_padded,pts_per_thread,slab_size,cta_size,num_ctas,NO_COMM_MASK>
-            <<<grid_size,cta_size,0,stream>>>(u, w, g, dxm1, dxtm1, nelt, d_sendcell_mask);
+        case NO_COMM_MASK: 
+          grid_size = nelt;          
+          ax_cuda_kernel_v10_shared_D<p,p_sq,p_cube,p_cube_padded,pts_per_thread,slab_size,cta_size,num_ctas,NO_COMM_MASK>
+            <<<grid_size,cta_size,0,stream>>>(u, w, g, dxm1, dxtm1, nelt, NULL);
           break;
         case BOUNDARY_ONLY: 
-          ax_cuda_kernel_v9_shared_D<p,p_sq,p_cube,p_cube_padded,pts_per_thread,slab_size,cta_size,num_ctas,BOUNDARY_ONLY>
-            <<<grid_size,cta_size,0,stream>>>(u, w, g, dxm1, dxtm1, nelt, d_sendcell_mask);
+          grid_size = nsend_cell;
+          ax_cuda_kernel_v10_shared_D<p,p_sq,p_cube,p_cube_padded,pts_per_thread,slab_size,cta_size,num_ctas,BOUNDARY_ONLY>
+            <<<grid_size,cta_size,0,stream>>>(u, w, g, dxm1, dxtm1, nelt, d_send_cell);
           break;
         case INTERIOR_ONLY: 
-          ax_cuda_kernel_v9_shared_D<p,p_sq,p_cube,p_cube_padded,pts_per_thread,slab_size,cta_size,num_ctas,INTERIOR_ONLY>
-            <<<grid_size,cta_size,0,stream>>>(u, w, g, dxm1, dxtm1, nelt, d_sendcell_mask);
+          grid_size = nint_cell;
+          ax_cuda_kernel_v10_shared_D<p,p_sq,p_cube,p_cube_padded,pts_per_thread,slab_size,cta_size,num_ctas,INTERIOR_ONLY>
+            <<<grid_size,cta_size,0,stream>>>(u, w, g, dxm1, dxtm1, nelt, d_int_cell);
           break;
         }
       }
@@ -754,7 +1031,6 @@ void axcuda_e(double *w, double *u, double *g, double *dxm1, double *dxtm1,
         const int p_cube_padded = p_cube;
 
         // We could play with this
-        const int grid_size = nelt;
 
         // BEST CONFIG
         const int cta_size = 576;
@@ -762,18 +1038,22 @@ void axcuda_e(double *w, double *u, double *g, double *dxm1, double *dxtm1,
         const int slab_size = 4;
         const int num_ctas = 2;
 
+        int grid_size;
         switch (comm_mask) {
-        case NO_COMM_MASK:
-          ax_cuda_kernel_v9_shared_D<p,p_sq,p_cube,p_cube_padded,pts_per_thread,slab_size,cta_size,num_ctas,NO_COMM_MASK>
-            <<<grid_size,cta_size,0,stream>>>(u, w, g, dxm1, dxtm1, nelt, d_sendcell_mask);
+        case NO_COMM_MASK: 
+          grid_size = nelt;
+          ax_cuda_kernel_v10_shared_D<p,p_sq,p_cube,p_cube_padded,pts_per_thread,slab_size,cta_size,num_ctas,NO_COMM_MASK>
+            <<<grid_size,cta_size,0,stream>>>(u, w, g, dxm1, dxtm1, nelt, NULL);
           break;
         case BOUNDARY_ONLY: 
-          ax_cuda_kernel_v9_shared_D<p,p_sq,p_cube,p_cube_padded,pts_per_thread,slab_size,cta_size,num_ctas,BOUNDARY_ONLY>
-            <<<grid_size,cta_size,0,stream>>>(u, w, g, dxm1, dxtm1, nelt, d_sendcell_mask);
+          grid_size = nsend_cell;
+          ax_cuda_kernel_v10_shared_D<p,p_sq,p_cube,p_cube_padded,pts_per_thread,slab_size,cta_size,num_ctas,BOUNDARY_ONLY>
+            <<<grid_size,cta_size,0,stream>>>(u, w, g, dxm1, dxtm1, nelt, d_send_cell);
           break;
         case INTERIOR_ONLY: 
-          ax_cuda_kernel_v9_shared_D<p,p_sq,p_cube,p_cube_padded,pts_per_thread,slab_size,cta_size,num_ctas,INTERIOR_ONLY>
-            <<<grid_size,cta_size,0,stream>>>(u, w, g, dxm1, dxtm1, nelt, d_sendcell_mask);
+          grid_size = nint_cell;
+          ax_cuda_kernel_v10_shared_D<p,p_sq,p_cube,p_cube_padded,pts_per_thread,slab_size,cta_size,num_ctas,INTERIOR_ONLY>
+            <<<grid_size,cta_size,0,stream>>>(u, w, g, dxm1, dxtm1, nelt, d_int_cell);
           break;
         }
       }
@@ -1368,7 +1648,28 @@ extern "C"
                  cudaMemcpyHostToDevice);
 //       if (gpu_dom.comm.id == 53)
 //       printf("P(%d): sendcell_mask = %d, nelt = %d\n", gpu_dom.comm.id,
-//              std::count_if(sendcell_mask, sendcell_mask+(*nelt), nonZero), *nelt);
+//              std::count_if(sendcell_mask, sendcell_mask+(*nelt), eqOne), *nelt);
+      nsend_cell = std::count_if(sendcell_mask, sendcell_mask+(*nelt), eqOne);
+      nint_cell = *nelt - nsend_cell;
+      int *int_cell = (int*)malloc(nint_cell*sizeof(int));
+      int *send_cell = (int*)malloc(nsend_cell*sizeof(int));
+      cudaMalloc(&d_int_cell, nint_cell*sizeof(int));
+      cudaMalloc(&d_send_cell, nsend_cell*sizeof(int));
+      int int_count = 0, send_count = 0;
+      for (int i = 0; i < *nelt; i++) {
+        if (sendcell_mask[i] == 0)
+          int_cell[int_count++] = i;
+        else
+          send_cell[send_count++] = i;
+      }
+      cudaMemcpy(d_int_cell, int_cell, nint_cell*sizeof(int), cudaMemcpyHostToDevice);
+      cudaMemcpy(d_send_cell, send_cell, nsend_cell*sizeof(int), cudaMemcpyHostToDevice);
+      if (int_count != nint_cell) {
+        printf("nint cell inconsistent\n");
+        exit(1);
+      }
+      free(int_cell);
+      free(send_cell);
       free(sendcell_mask);
     }
 
@@ -1588,6 +1889,8 @@ extern "C"
 
     cudaFree(d_send_mask);
     cudaFree(d_sendcell_mask);
+    cudaFree(d_int_cell);
+    cudaFree(d_send_cell);
 
     /* free GPU memory for u, w, ur, us, ut, g, dxm1, dxtm1  */
 
