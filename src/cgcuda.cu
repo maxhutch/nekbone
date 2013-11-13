@@ -1,4 +1,3 @@
-
 #include <stdio.h>
 #include <algorithm>
 #include "cuda_runtime.h"
@@ -21,7 +20,6 @@
 
 //#define DEBUG
 cublasHandle_t cublas_handle;
-//extern cublasHandle_t cublas_ctx;
 cudaStream_t stream[2];
 
 //#define TIME_AX
@@ -29,7 +27,6 @@ cudaStream_t stream[2];
 //#define AOS
 
 #include <sys/time.h>
-
 class CTimer
 {
 protected:
@@ -446,265 +443,6 @@ template<typename T>
 
 template<int p, int p_sq, int p_cube, int p_cube_padded, int pts_per_thread, int slab_size, int cta_size, int num_ctas, int comm_mask>
 __global__
-//__launch_bounds__(cta_size,num_ctas)
-void ax_cuda_kernel_v9_shared_D(const double* __restrict__ u_global, 
-                                double* __restrict__ w, 
-                                const double* __restrict__ g, 
-                                const double* __restrict__ dxm1, 
-                                const double* __restrict__ dxtm1, int n_cells, 
-                                uint *sendcell_mask)
-{
-  int tid = threadIdx.x;
-  __shared__ double temp[cta_size];
-  __shared__ double s_dxm1[p_sq];
-  __shared__ double s_dxtm1[p_sq];
-
-  //for (int cell_id=blockIdx.x; cell_id < n_cells; cell_id += gridDim.x)
-  int cell_id = blockIdx.x;
-  {
-    if (comm_mask == BOUNDARY_ONLY) {
-      if (sendcell_mask[cell_id] == 0) return;
-    } else if (comm_mask == INTERIOR_ONLY) {
-      if (sendcell_mask[cell_id] == 1) return;
-    }
-    // Load u in shared for the entire cell
-    int offset = cell_id*p_cube;
-
-    int tid_mod_p = tid%p;
-    int tid_div_p = tid/p;
-    int tid_mod_p_sq = tid%p_sq;
-    int tid_div_p_sq = tid/p_sq;
-
-    double u[pts_per_thread];
-    #pragma unroll
-    for (int k=0;k<pts_per_thread;k++)
-    {
-      int pt_id = k*cta_size + tid;
-
-      u[k] = ld_functions::ld_cg(&u_global[offset + pt_id]);
-    }
-
-    // Store dxm1 and dxtm1 in shared memory
-    if (tid < p_sq)
-    {
-      s_dxm1[tid] = ld_functions::ld_cg(&dxm1[tid]);
-      s_dxtm1[tid] = ld_functions::ld_cg(&dxtm1[tid]);
-    }
-
-
-    // Initialize wa to 0.
-    double wa[pts_per_thread];
-    #pragma unroll
-    for (int k=0;k<pts_per_thread;k++)
-      wa[k] = 0.;
-
-    // Now compute w for one slab at a time
-    #pragma unroll
-    for (int k=0;k<pts_per_thread;k++)
-    {
-      int pt_id = k*cta_size + tid;
-      //int pt_id_div_p = pt_id/p;
-      //int pt_id_mod_p = pt_id%p;
-      int pt_id_div_p_sq = pt_id/p_sq;
-      //int pt_id_mod_p_sq = pt_id%p_sq;
-
-      double ur, us, ut;
-
-      // Load first slab in shared memory
-      __syncthreads();
-      temp[tid] = u[k];
-      __syncthreads();
-      
-
-      //  Now that data is loaded in shared, compute ur
-      {
-        int s_offset = tid_div_p*p;
-        int d_offset  = tid_mod_p;
-
-        ur = 0.;
-        #pragma unroll
-        for (int i=0;i<p;i++)
-          ur += s_dxm1[d_offset + p*i]*temp[s_offset + i];
-          //ur += __ldg(&dxm1[d_offset + p*i])*temp[s_offset + i];
-      }
-
-      // Compute us
-      {
-        int plane = tid_div_p_sq;
-        int s_offset = plane*p_sq + tid_mod_p;
-        int d_offset = p*( (tid-plane*p_sq)/p);
-
-        us = 0.;
-        #pragma unroll
-        for (int i=0;i<p;i++)
-          us += temp[s_offset + p*i]*s_dxtm1[d_offset + i];
-         // us += temp[s_offset + p*i]*__ldg(&dxtm1[d_offset + i]);
-      }
-
-
-      // Load all slabs in shared, one by one to compute ut
-      ut = 0.;
-      #pragma unroll
-      for (int k2=0;k2<pts_per_thread;k2++)
-      {
-        int i_start = k2*slab_size;
-
-        // Load in shared
-        __syncthreads();
-        temp[tid] = u[k2];
-        __syncthreads();
-
-        // Compute ut
-        int s_offset = tid_mod_p_sq;
-        int d_offset = pt_id_div_p_sq*p;
-
-        #pragma unroll
-        for (int icount=0;icount<slab_size;icount++)
-        {
-          //ut += temp[s_offset + p_sq*icount]*__ldg(&dxtm1[d_offset + i_start]);
-          ut += temp[s_offset + p_sq*icount]*s_dxtm1[d_offset + i_start];
-          i_start++;
-        }
-      }
-
-      // Transform
-      {
-
-
-        /*
-        int offset = (cell_id*p_cube + pt_id)*6;
-        //TODO: Switch to SOA
-        double metric[6];
-        #pragma unroll
-        for (int i=0;i<6;i++)
-          metric[i] = g[offset+i];
-
-        */
-
-        // AoS version
-#ifdef AOS
-        int offset = cell_id*p_cube + pt_id;
-        //TODO: Switch to SOA
-        double metric[6];
-        #pragma unroll
-        for (int i=0;i<6;i++)
-          metric[i] = g[offset+i*n_cells*p_cube];
-#else
-        int offset = (cell_id*p_cube + pt_id)*6;
-        double metric[6];
-        #pragma unroll
-        for (int i=0;i<6;i++)
-          metric[i] = g[offset+i];
-#endif
-          //metric[i] = ld_functions::ld_cg(&g[offset+i*n_cells*p_cube]);
-          //metric[i] = g[offset+i*n_cells*p_cube];
-
-          //metric[i] = ld_functions::ld_cg(&g[offset+i]);
-          //metric[i] = g[offset+i];
-
-
-        // SOA HACK
-        /*
-        int offset = cell_id*p_cube + pt_id;
-
-        //TODO: Switch to SOA
-        double metric[6];
-        #pragma unroll
-        for (int i=0;i<6;i++)
-        {
-          //metric[i] = g[offset];
-          metric[i] = ld_functions::ld_cg(&g[offset]);
-          offset += n_cells*p_cube;
-        }
-        */
-
-
-
-          //metric[i] = ld_functions::ld_cg(&(g[offset+i]));
-
-        double wr = metric[0]*ur + metric[1]*us + metric[2]*ut;
-        double ws = metric[1]*ur + metric[3]*us + metric[4]*ut;
-        double wt = metric[2]*ur + metric[4]*us + metric[5]*ut;
-
-        ur = wr;
-        us = ws;
-        ut = wt;
-      }
-
-      // Store ur in shared memory
-      __syncthreads();
-      temp[tid] = ur;
-      __syncthreads();
-
-      // Now that data is loaded in shared, compute wa
-
-      {
-        int d_offset  = tid_mod_p;
-        int s_offset = tid_div_p*p;
-
-        #pragma unroll
-        for (int i=0;i<p;i++)
-          wa[k] += s_dxtm1[d_offset+p*i]*temp[s_offset + i];
-          //wa[k] += __ldg(&dxtm1[d_offset+p*i])*temp[s_offset + i];
-      }
-
-      __syncthreads();
-      temp[tid] = us;
-      __syncthreads();
-
-      // Compute us
-      {
-
-        int plane = tid_div_p_sq;
-        int s_offset = plane*p_sq + tid_mod_p;
-        int d_offset = p*( (tid-plane*p_sq)/p);
-
-        #pragma unroll
-        for (int i=0;i<p;i++)
-          wa[k] += temp[s_offset + p*i]*s_dxm1[d_offset + i];
-          //wa[k] += temp[s_offset + p*i]*__ldg(&dxm1[d_offset + i]);
-      }
-
-      __syncthreads();
-      // Store ut in shared memory
-      temp[tid] = ut;
-      __syncthreads();
-
-      #pragma unroll
-      for (int k2=0;k2<pts_per_thread;k2++)
-      {
-        int i_start = k*slab_size;
-        int pt_id_2 = k2*cta_size + tid;
-        int plane = pt_id_2/p_sq;
-
-        int s_offset = tid_mod_p_sq;
-        int d_offset = plane*p;
-
-        #pragma unroll
-        for (int i_count=0; i_count < slab_size; i_count++)
-        {
-          wa[k2] += temp[s_offset + p_sq*i_count]*s_dxm1[d_offset + i_start];
-          //wa[k2] += temp[s_offset + p_sq*i_count]*__ldg(&dxm1[d_offset + i_start]);
-          i_start++;
-        }
-      }
-      __syncthreads();
-
-    } // Loop over k
-
-    #pragma unroll
-    for (int k=0;k<pts_per_thread;k++)
-    {
-      int pt_id = k*cta_size + tid;
-      w[offset + pt_id] = wa[k];
-    }
-  } // Loop over blocks
-
-}
-
-
-template<int p, int p_sq, int p_cube, int p_cube_padded, int pts_per_thread, int slab_size, int cta_size, int num_ctas, int comm_mask>
-__global__
 __launch_bounds__(cta_size,num_ctas)
 void ax_cuda_kernel_v10_shared_D(const double* __restrict__ u_global, 
                                 double* __restrict__ w, 
@@ -988,20 +726,6 @@ void axcuda_e(double *w, double *u, double *g, double *dxm1, double *dxtm1,
         const int slab_size = 3;
 
         const int num_ctas = 4;
-//         switch (comm_mask) {
-//         case NO_COMM_MASK:
-//           ax_cuda_kernel_v9_shared_D<p,p_sq,p_cube,p_cube_padded,pts_per_thread,slab_size,cta_size,num_ctas,NO_COMM_MASK>
-//             <<<grid_size,cta_size,0,stream>>>(u, w, g, dxm1, dxtm1, nelt, d_sendcell_mask);
-//           break;
-//         case BOUNDARY_ONLY: 
-//           ax_cuda_kernel_v9_shared_D<p,p_sq,p_cube,p_cube_padded,pts_per_thread,slab_size,cta_size,num_ctas,BOUNDARY_ONLY>
-//             <<<grid_size,cta_size,0,stream>>>(u, w, g, dxm1, dxtm1, nelt, d_sendcell_mask);
-//           break;
-//         case INTERIOR_ONLY: 
-//           ax_cuda_kernel_v9_shared_D<p,p_sq,p_cube,p_cube_padded,pts_per_thread,slab_size,cta_size,num_ctas,INTERIOR_ONLY>
-//             <<<grid_size,cta_size,0,stream>>>(u, w, g, dxm1, dxtm1, nelt, d_sendcell_mask);
-//           break;
-//         }
         int grid_size;
         switch (comm_mask) {
         case NO_COMM_MASK: 
@@ -1162,8 +886,6 @@ void gs_op_cuda(double* w, int dom, int op, int in_transpose)
 
 void gs_op_cuda_mpi(double* w, int dom, int op, int in_transpose)
 {
-//   cudaDeviceSynchronize();
-//   timer.Start();
   cudaCheckError();
   bool transpose = (in_transpose!=0);
 
@@ -1174,7 +896,7 @@ void gs_op_cuda_mpi(double* w, int dom, int op, int in_transpose)
 
   local_gather_cuda(w,w,&(gpu_dom.local_map[0^transpose]),BOUNDARY_ONLY,stream[0]);
 
-//   cudaCheckError();
+  cudaCheckError();
 
   // Fill send buffer
   local_scatter_cuda(gpu_dom.d_buffer+recv_size, w, &(gpu_dom.comm_map[send]), stream[0]);
@@ -1200,8 +922,8 @@ void gs_op_cuda_mpi(double* w, int dom, int op, int in_transpose)
   local_gather_cuda(w, gpu_dom.d_buffer, &(gpu_dom.comm_map[recv]), NO_COMM_MASK, NULL );
 
   local_scatter_cuda(w, w, &(gpu_dom.local_map[1^transpose]), NULL);
-//   cudaDeviceSynchronize();
-//   time_gs += timer.GetET();
+  
+  cudaCheckError();
 }
 
 
@@ -1222,15 +944,6 @@ __global__ void add2s1_kernel(double *a, double *b, double c1, int n)
 
 void add2s1_cuda(double *a, double *b, double c1, int n)
 {
-
- // TODO: should probably merge into single kernel
-
-//   double one = 1.;
-//   cublasDscal(cublas_handle, n, &c1, a, 1); 
-//   cudaCheckError();
-//   cublasDaxpy(cublas_handle, n, &one, b, 1, a, 1);
-//   cudaCheckError();
-
   int block = 256;
   int grid = (n + block - 1) / block;
   add2s1_kernel<<<grid, block>>>(a, b, c1, n);
@@ -1536,12 +1249,6 @@ extern "C"
     gpu_dom.comm.id = comm_id;
     gpu_dom.comm.np = comm_np;
 
-//     printf("******** P(%d): recv n = %d, tot = %d, send n = %d, tot = %d\n", 
-//            comm_id, comm_0_n, comm_0_total, comm_1_n, comm_1_total);
-//     for (int i = 0; i < comm_0_n; i++)
-//       printf("P(%d): recv %d size: %d\n", comm_id, i, comm_0_size[i]);
-//     for (int i = 0; i < comm_1_n; i++)
-//       printf("P(%d): send %d size: %d\n", comm_id, i, comm_1_size[i]);
     if (gpu_dom.comm.np > 1)
     {
       // Initialize the communication structure
@@ -1581,14 +1288,8 @@ extern "C"
                      int* nx1, int* ny1, int* nz1, int* nelt, int* ldim, double* dxm1, double* dxtm1, 
                      int* niter, double* flop_cg, const int *gsh_handle, int* nid)
   {
-//     if (gpu_dom.comm.id == 53)
-//     printf("P(%d): local gather size_from = %d, scatter size_from = %d, send size_from = %d, recv size_from = %d\n", 
-//            gpu_dom.comm.id,
-//            gpu_dom.local_map[0].size_from, gpu_dom.local_map[1].size_from,
-//            gpu_dom.comm_map[0].size_from, gpu_dom.comm_map[1].size_from);
     for (int i = 0; i < 2; i++) {
       cudaStreamCreate(&stream[i]);
-      //stream[i] = NULL;
     }
     uint* local_indices_from = (uint*)malloc(gpu_dom.local_map[0].size_from*sizeof(uint));
     uint* comm_indices_from = (uint*)malloc(gpu_dom.comm_map[1].size_from*sizeof(uint));
@@ -1597,18 +1298,6 @@ extern "C"
     cudaMemcpy(comm_indices_from, gpu_dom.comm_map[1].d_indices_from,
                gpu_dom.comm_map[1].size_from*sizeof(uint), cudaMemcpyDeviceToHost);
 
-//     if (gpu_dom.comm.id == 1) {
-//     printf("local:\n");
-//     for (int i = 0; i < gpu_dom.local_map[0].size_from; i++) {
-//       printf("(%d,%d) ", local_indices_from[i], local_indices_from[i] / 1728);
-//     }
-//     printf("\n\n");
-//     printf("comm:\n");
-//     for (int j = 0; j < gpu_dom.comm_map[1].size_from; j++) {
-//       printf("(%d,%d) ", comm_indices_from[j], comm_indices_from[j] / 1728);
-//     }
-//     printf("\n\n");
-//     }
     // 
     // setup send point mask
     //
@@ -1625,9 +1314,6 @@ extern "C"
       }
       cudaMemcpy(d_send_mask, send_mask, gpu_dom.local_map[0].size_from*sizeof(uint),
                  cudaMemcpyHostToDevice);
-//       if (gpu_dom.comm.id == 53)
-//       printf("P(%d): send_mask = %d\n", gpu_dom.comm.id,
-//              std::count_if(send_mask, send_mask+gpu_dom.local_map[0].size_from, nonZero));
       free(send_mask);
     }
 
@@ -1639,16 +1325,12 @@ extern "C"
       memset(sendcell_mask, 0, sizeof(uint)*(*nelt));
       cudaMalloc(&d_sendcell_mask, sizeof(uint)*(*nelt));
 
-
       int nxyz = (*nx1)*(*ny1)*(*nz1);
       for (int i = 0; i < gpu_dom.comm_map[1].size_from; i++) {
         sendcell_mask[comm_indices_from[i]/nxyz] = 1;
       }
       cudaMemcpy(d_sendcell_mask, sendcell_mask, sizeof(uint)*(*nelt),
                  cudaMemcpyHostToDevice);
-//       if (gpu_dom.comm.id == 53)
-//       printf("P(%d): sendcell_mask = %d, nelt = %d\n", gpu_dom.comm.id,
-//              std::count_if(sendcell_mask, sendcell_mask+(*nelt), eqOne), *nelt);
       nsend_cell = std::count_if(sendcell_mask, sendcell_mask+(*nelt), eqOne);
       nint_cell = *nelt - nsend_cell;
       int *int_cell = (int*)malloc(nint_cell*sizeof(int));
@@ -1664,6 +1346,7 @@ extern "C"
       }
       cudaMemcpy(d_int_cell, int_cell, nint_cell*sizeof(int), cudaMemcpyHostToDevice);
       cudaMemcpy(d_send_cell, send_cell, nsend_cell*sizeof(int), cudaMemcpyHostToDevice);
+      // check
       if (int_count != nint_cell) {
         printf("nint cell inconsistent\n");
         exit(1);
@@ -1675,8 +1358,6 @@ extern "C"
 
     free(local_indices_from);
     free(comm_indices_from);
-    
-
 
     // Initialize gpu_dom structure
     // Note: the gsh structure on the GPU is already initialized, since gs_cuda_setup is called in the proxy_setupds function in driver.f
@@ -1689,7 +1370,6 @@ extern "C"
     gpu_dom.nelt = (*nelt);
     gpu_dom.niter = (*niter);
     gpu_dom.mask_length = (int) cmask[1];
-    //printf("mask_length = %d \n", gpu_dom.mask_length);
 
     int nxyz = (*nx1)*(*ny1)*(*nz1);
     
@@ -1791,21 +1471,6 @@ extern "C"
     mask_cuda(gpu_dom.d_r, gpu_dom.nid, gpu_dom.d_mask, gpu_dom.mask_length);
 
     double rnorm = sqrt(glsc3_cuda(gpu_dom.d_r, gpu_dom.d_c, gpu_dom.d_r, n));
-
-//     double *t1, *t2, *t3;
-//     cudaMalloc(&t1, n*sizeof(double));
-//     cudaMalloc(&t2, n*sizeof(double));
-//     cudaMalloc(&t3, n*sizeof(double));
-//     {
-//       int block = 256;
-//       int grid = (n + block - 1) / block;
-//       init_t<<<grid, block>>>(t1, t2, t3, n);
-//     }
-//     double t = glsc3_cuda(t1, t2, t3, n);
-//     printf("t = %f, n = %d\n", t, n);
-//     cudaFree(t1);
-//     cudaFree(t2);
-//     cudaFree(t3);
       
     int iter = 0;
     if (gpu_dom.nid==0) 
@@ -1828,13 +1493,23 @@ extern "C"
        add2s1_cuda(gpu_dom.d_p, gpu_dom.d_z, beta, n);
        
        if (gpu_dom.comm.np == 1) {
-         axcuda_no_overlap(gpu_dom.d_w, gpu_dom.d_p, gpu_dom.d_g, gpu_dom.d_dxm1, gpu_dom.d_dxtm1, gpu_dom.nx1, gpu_dom.ny1, gpu_dom.nz1, gpu_dom.nelt, gpu_dom.ldim, gpu_dom.nid, gpu_dom.d_mask, gpu_dom.mask_length, flop_a);         
+         axcuda_no_overlap(gpu_dom.d_w, gpu_dom.d_p, gpu_dom.d_g, gpu_dom.d_dxm1, gpu_dom.d_dxtm1, 
+                           gpu_dom.nx1, gpu_dom.ny1, gpu_dom.nz1, gpu_dom.nelt, gpu_dom.ldim, 
+                           gpu_dom.nid, gpu_dom.d_mask, gpu_dom.mask_length, flop_a);         
        } else {
 #ifdef TIME_AX
          cudaDeviceSynchronize();
          timer2.Start();
 #endif
-         axcuda_tot_overlap(gpu_dom.d_w, gpu_dom.d_p, gpu_dom.d_g, gpu_dom.d_dxm1, gpu_dom.d_dxtm1, gpu_dom.nx1, gpu_dom.ny1, gpu_dom.nz1, gpu_dom.nelt, gpu_dom.ldim, gpu_dom.nid, gpu_dom.d_mask, gpu_dom.mask_length, flop_a);
+//          axcuda_no_overlap(gpu_dom.d_w, gpu_dom.d_p, gpu_dom.d_g, gpu_dom.d_dxm1, gpu_dom.d_dxtm1, 
+//                            gpu_dom.nx1, gpu_dom.ny1, gpu_dom.nz1, gpu_dom.nelt, gpu_dom.ldim, 
+//                            gpu_dom.nid, gpu_dom.d_mask, gpu_dom.mask_length, flop_a);
+//          axcuda_part_overlap(gpu_dom.d_w, gpu_dom.d_p, gpu_dom.d_g, gpu_dom.d_dxm1, gpu_dom.d_dxtm1, 
+//                             gpu_dom.nx1, gpu_dom.ny1, gpu_dom.nz1, gpu_dom.nelt, gpu_dom.ldim, 
+//                             gpu_dom.nid, gpu_dom.d_mask, gpu_dom.mask_length, flop_a);         
+         axcuda_tot_overlap(gpu_dom.d_w, gpu_dom.d_p, gpu_dom.d_g, gpu_dom.d_dxm1, gpu_dom.d_dxtm1, 
+                            gpu_dom.nx1, gpu_dom.ny1, gpu_dom.nz1, gpu_dom.nelt, gpu_dom.ldim, 
+                            gpu_dom.nid, gpu_dom.d_mask, gpu_dom.mask_length, flop_a);
 #ifdef TIME_AX
          cudaDeviceSynchronize();
          timeax[0] += timer2.GetET();
@@ -1870,19 +1545,20 @@ extern "C"
 
   void cg_cuda_free_() 
   {
-//     {
-//     float maxtime;
-//     MPI_Allreduce(timeax, &maxtime, 1, MPI_FLOAT, MPI_MAX, gpu_dom.comm.mpi_comm);
-//     if (fabs(timeax[0] - maxtime) < 1e-5 || gpu_dom.comm.id == 0) {
-//     printf("P(%d): timeax = %f, %f, %f, %f, %f, %f\n",
-//            gpu_dom.comm.id, timeax[0]*1e3, timeax[1]*1e3, 
-//            timeax[2]*1e3, timeax[3]*1e3, timeax[4]*1e3, timeax[5]*1e3);
-//     printf("P(%d): local gather size_from = %d, scatter size_from = %d, send size_from = %d, recv size_from = %d\n", 
-//            gpu_dom.comm.id,
-//            gpu_dom.local_map[0].size_from, gpu_dom.local_map[1].size_from,
-//            gpu_dom.comm_map[0].size_from, gpu_dom.comm_map[1].size_from);
-//     }
-//     }
+#ifdef TIME_AX
+    {
+      float maxtime;
+      MPI_Allreduce(timeax, &maxtime, 1, MPI_FLOAT, MPI_MAX, gpu_dom.comm.mpi_comm);
+      if (fabs(timeax[0] - maxtime) < 1e-5 || gpu_dom.comm.id == 0) {
+        printf("P(%d): timeax = %f, %f, %f, %f, %f, %f\n",
+               gpu_dom.comm.id, timeax[0]*1e3, timeax[1]*1e3, 
+               timeax[2]*1e3, timeax[3]*1e3, timeax[4]*1e3, timeax[5]*1e3);
+        printf("P(%d): local gather size_from = %d, scatter size_from = %d, send size_from = %d, recv size_from = %d\n", 
+               gpu_dom.comm.id,
+               gpu_dom.local_map[0].size_from, gpu_dom.local_map[1].size_from,
+               gpu_dom.comm_map[0].size_from, gpu_dom.comm_map[1].size_from);
+      }
+#endif 
 
     for (int i = 0; i < 2; i++)
       cudaStreamDestroy(stream[i]);
