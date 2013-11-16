@@ -1186,7 +1186,7 @@ void fgs_setup(sint *handle, const slong id[], const sint *n,
   gs_setup_aux(gsh,id,*n,0,gs_auto,1);
   *handle = fgs_n++;
 #ifdef USE_CUDA
-  printf("Setting up cuda gs\n");
+//  printf("Setting up cuda gs\n");
   gs_setup_cuda(gsh->map_local[0], gsh->map_local[1], gsh->flagged_primaries);
 #endif
 }
