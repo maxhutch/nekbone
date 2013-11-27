@@ -14,6 +14,7 @@ c-----------------------------------------------------------------------
       real r_gpu(lt)
       real g(6,lt)
       real mfloplist(1024), avmflop
+      real mflops_cpu, mflops_gpu, gpu_cpu_diff
       integer icount
 
       logical ifbrick
@@ -38,7 +39,10 @@ c     iverbose = 1
 c     call platform_timer(iverbose)   ! iverbose=0 or 1
 
       icount = 0
-      write(6,5) 'nelt', 'nx1', 'MFlops', 'FlopSet', 'FlopSlv'
+      if (nid .eq. 0) then
+      write(6,5) 'nelt','nx1','MFlops GPU','MFlops CPU','GPU CPU Diff',
+     &  'Speedup'
+      endif
 
 c     SET UP and RUN NEKBONE
       do nx1=nx0,nxN,nxD
@@ -74,7 +78,7 @@ c     SET UP and RUN NEKBONE
            call nekgsync()
 
            ! Run same computation on host
-           call set_timer_flop_cnt(0)
+           call set_timer_flop_cnt(0,mflops_cpu)
            time_beg = dnekclock()
            call cg(x,f,g,c,r,w,p,z,n,niter,flop_cg, .false.)
            time_end = dnekclock()
@@ -82,7 +86,7 @@ c     SET UP and RUN NEKBONE
               write(6,*) "CPU time: ",time_end-time_beg
               write(6,*) "---------------------------------------------"
            endif 
-           call set_timer_flop_cnt(1)
+           call set_timer_flop_cnt(1,mflops_cpu)
            call nekgsync()
 
            ! Copy gpu results for future comparison
@@ -106,11 +110,11 @@ c     +                    it, r_gpu(it), r(it)
 c               exit
 c             endif 
 c           end do
-           write(6,*) "Max CPU GPU diff= ", maxval(r_gpu-r)
+           gpu_cpu_diff = maxval(r_gpu-r)
 
            ! Rerun with timing, without copying back to host
 
-           call set_timer_flop_cnt(0)
+           call set_timer_flop_cnt(0,mflops_gpu)
 c          call summary_start()
 
            if (nid .eq. 0) then
@@ -130,7 +134,11 @@ c          call summary_start()
               write(6,*) "GPU time: ",time_end-time_beg
               write(6,*) "---------------------------------------------"
            endif 
-           call set_timer_flop_cnt(1)
+           call set_timer_flop_cnt(1,mflops_gpu)
+           if (nid .eq. 0) then
+           write(6,6) nelt, nx1, mflops_gpu, mflops_cpu, gpu_cpu_diff, 
+     &                mflops_gpu / mflops_cpu
+           endif
            call nekgsync()
 
 c          call summary_stop()
@@ -145,7 +153,9 @@ c          call summary_stop()
       enddo
 
   5   format('| ' A7,' | ' A7,' | ' A12,
-     &       ' | ', A12, ' | ', A12, ' | ')
+     &       ' | ', A12, ' | ', A12, ' | ', A9, ' | ')
+  6   format('| ' i7,' | ' i7,' | ' es12.4,
+     &         ' | ', es12.4, ' | ', es12.4, ' | ', F9.3, ' | ')
 
 c     TEST BANDWIDTH BISECTION CAPACITY
 c     call xfer(np,cr_h)
@@ -363,12 +373,13 @@ c-----------------------------------------------------------------------
       return
       end
 c-----------------------------------------------------------------------
-      subroutine set_timer_flop_cnt(iset)
+      subroutine set_timer_flop_cnt(iset, mflops_return)
       include 'SIZE'
       include 'TOTAL'
 
       real time0,time1
       save time0,time1
+      real mflops_return 
 
       if (iset.eq.0) then
          flop_a  = 0
@@ -376,14 +387,15 @@ c-----------------------------------------------------------------------
          time0   = dnekclock()
       else
         time1   = dnekclock()-time0
-        if (time1.gt.0) mflops = (flop_a+flop_cg)/(1.e6*time1)
+        if (time1.gt.0) mflops_return = (flop_a+flop_cg)/(1.e6*time1)
+        write(*,*) mflops_return
         if (nid.eq.0) then
-          write(6,*)
-          write(6,1) nelt,np,nx1, nelt*np
-          write(6,2) mflops*np, mflops
-          write(6,3) flop_a,flop_cg
-          write(6,4) time1
-          write(6,5) nelt, nx1, mflops, flop_a, flop_cg
+!          write(6,*)
+!          write(6,1) nelt,np,nx1, nelt*np
+!          write(6,2) mflops*np, mflops
+!          write(6,3) flop_a,flop_cg
+!          write(6,4) time1
+!          write(6,5) nelt, nx1, mflops, flop_a, flop_cg
         endif
     1   format('nelt = ' i7, ', np = ', i9 ', nx1 = ', i7,
      &         ', elements =', i10 )
@@ -393,7 +405,6 @@ c-----------------------------------------------------------------------
     5   format('| ' i7,' | ' i7,' | ' e12.4,
      &         ' | ', e12.4, ' | ', e12.4, ' | ')
       endif
-
       return
       end
 c-----------------------------------------------------------------------
