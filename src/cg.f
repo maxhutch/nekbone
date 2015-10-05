@@ -78,7 +78,7 @@ c        if (rtr.le.rlim2) goto 1001
 
       if (nid.eq.0) write(6,6) iter,rnorm,alpha,beta,pap
 
-      flop_cg = flop_cg + iter*15*n
+      flop_cg = flop_cg + iter*15.*n
 
       return
       end

@@ -1,6 +1,0 @@
- .true.      = ifbrick                    ! brick or linear geometry
-100   100 1   = iel0,ielN(per proc),stride ! range of number of elements per proc.
- 8 10  2   = nx0,nxN,stride             ! poly. order range for nx1
- 4  1  1    = npx,npy,npz                ! np distrb, if != np, nekbone creates
- 25  2  2    = mx,my,mz                   ! nelt distrb, if != nelt, nekbone creates
- .false.     = ifmgrid                    ! multi-grid precond.

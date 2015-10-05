@@ -173,6 +173,7 @@ c----------------------------------------------------------------------
       include 'HSMG'
       integer i,l
 
+      i=0
       do l=1,mg_h1_lmax
          mg_rstr_wt_index(l,mg_fld)=i
          i=i+mg_nh(l)*mg_nhz(l)*2*ndim*nelt

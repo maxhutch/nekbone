@@ -311,7 +311,7 @@ c-----------------------------------------------------------------------
           write(6,3) flop_a,flop_cg
           write(6,4) time1
         endif
-    1   format('nelt = ' i7, ', np = ', i9 ', nx1 = ', i7,
+    1   format('nelt = ',i7, ', np = ', i9,', nx1 = ', i7,
      &         ', elements =', i10 )
     2   format('Tot MFlops = ', 1pe12.4, ', MFlops      = ', e12.4)
     3   format('Setup Flop = ', 1pe12.4, ', Solver Flop = ', e12.4)
@@ -410,21 +410,21 @@ c----------------------------------------------------------------------
       !open .rea
       ifbrick = .false.  
       ifmgrid = .false.  !initialize to false
+      npx=0
+      npy=0
+      npz=0
+      mx =0
+      my =0
+      mz =0
 
       if(nid.eq.0) then
          open(unit=9,file='data.rea',status='old') 
          read(9,*,err=100) ifbrick
          read(9,*,err=100) iel0,ielN,ielD
          read(9,*,err=100) nx0,nxN,nxD
-         read(9,*,err=100) npx,npy,npz
-         read(9,*,err=100) mx,my,mz
+         read(9,*,err=100,iostat=ii) npx,npy,npz !optional
+         read(9,*,err=100,iostat=ii) mx,my,mz    !optional 
          close(9)
-
-         if(ifbrick.eq.'T'.or.ifbrick.eq.'t') then
-             ifbrick = .true.
-         elseif(ifbrick.eq.'F'.or.ifbrick.eq.'f') then
-             ifbrick = .false.
-         endif
       endif
       call bcast(ifbrick,4)
 
@@ -451,7 +451,7 @@ c----------------------------------------------------------------------
       if(iel0.gt.ielN.or.nx0 .gt.nxN)    goto 200
       if(ielN.gt.lelt.or.nxN .gt.lx1)    goto 210
       if(ielD.gt.ielN.or.nxD.gt.nxN)     goto 220
-      if(nx0.lt.4.and.ifmgrid.eq..true.) goto 230
+      if(nx0.lt.4.and.ifmgrid)           goto 230
 
       if(nid.eq.0) write(6,*) "ifmgrid    :",ifmgrid
      $                   ,"    ifbrick    :",ifbrick
